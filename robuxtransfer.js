@@ -3,6 +3,8 @@
    Uses Roblox's authenticated web requests. Roblox Plus and transfer eligibility apply.
    No extension is needed. If Roblox requires verification, complete it through Roblox.
    Robux is sent only after clicking Send Robux. Review prepares the transfer first.
+   Single-recipient sends refresh balance and limits, with two follow-up checks for delayed updates.
+   Batch transfer spaces recipients 10 seconds apart and refreshes account data after the queue stops.
    Request flow checked against RoValra's public source, independently implemented here.
    https://github.com/NotValra/RoValra/blob/main/src/content/features/plus/sendRobux.js
 */
@@ -24,6 +26,7 @@
   const searchRequests = new Map();
   const knownUsers = new Map();
   const searchStateKey = 'robux-transfer-user-search';
+  const themeKey = 'robux-transfer-ui-theme';
   let savedSearch = {};
   try { savedSearch = JSON.parse(sessionStorage.getItem(searchStateKey)) || {}; } catch { /* Start with an empty cache. */ }
   const searchCache = new Map(Array.isArray(savedSearch.cache) ? savedSearch.cache : []);
@@ -52,23 +55,33 @@
     return node;
   }
 
-  function robuxIcon() {
+  function svgIcon(paths, className = 'ui-icon', viewBox = '0 0 24 24') {
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    icon.setAttribute('viewBox', '0 0 24 24');
-    icon.setAttribute('class', 'robux-icon');
+    icon.setAttribute('viewBox', viewBox);
+    icon.setAttribute('class', className);
     icon.setAttribute('aria-hidden', 'true');
-    const outline = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    outline.setAttribute('d', 'M12 2 21 7v10l-9 5-9-5V7Z');
-    outline.setAttribute('fill', 'none');
-    outline.setAttribute('stroke', 'currentColor');
-    outline.setAttribute('stroke-width', '1.6');
-    outline.setAttribute('stroke-linejoin', 'round');
-    const center = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    center.setAttribute('d', 'M12 6 17 9v6l-5 3-5-3V9ZM10 10v4h4v-4Z');
-    center.setAttribute('fill', 'currentColor');
-    center.setAttribute('fill-rule', 'evenodd');
-    icon.append(outline, center);
+    for (const attrs of paths) {
+      const shape = document.createElementNS('http://www.w3.org/2000/svg', attrs.tag || 'path');
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k !== 'tag') shape.setAttribute(k, v);
+      }
+      icon.append(shape);
+    }
     return icon;
+  }
+
+  function robuxIcon() {
+    return svgIcon([
+      { d: 'M12 2 21 7v10l-9 5-9-5V7Z', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.7', 'stroke-linejoin': 'round' },
+      { d: 'M12 6 17 9v6l-5 3-5-3V9ZM10 10v4h4v-4Z', fill: 'currentColor', 'fill-rule': 'evenodd' },
+    ], 'robux-icon');
+  }
+
+  function animatePanel(node) {
+    if (!node) return;
+    node.classList.remove('panel-enter');
+    void node.offsetWidth;
+    node.classList.add('panel-enter');
   }
 
   function showRobux(node, value) {
@@ -80,9 +93,13 @@
   function createAvatar(userId, username) {
     const avatar = element('span', '', { class: 'avatar', 'aria-hidden': 'true' });
     avatar.dataset.userId = String(userId);
-    const placeholder = element('span', (username || '?').charAt(0).toUpperCase());
+    const placeholder = element('span', (username || '?').charAt(0).toUpperCase(), { class: 'avatar-fallback' });
     const image = element('img', '', { alt: '', width: '44', height: '44', hidden: '', referrerpolicy: 'no-referrer' });
-    image.addEventListener('load', () => { image.hidden = false; placeholder.hidden = true; });
+    image.addEventListener('load', () => {
+      image.hidden = false;
+      image.classList.add('loaded');
+      placeholder.hidden = true;
+    });
     image.addEventListener('error', () => { image.hidden = true; placeholder.hidden = false; });
     avatar.append(placeholder, image);
     return avatar;
@@ -96,8 +113,10 @@
         try {
           const url = new URL(thumbnailsApi);
           url.search = new URLSearchParams({ userIds: missingIds.join(','), size: '100x100', format: 'Png', isCircular: 'true' });
-          const response = await fetch(url, { credentials: 'omit',
-            signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(8000)]) });
+          const response = await fetch(url, {
+            credentials: 'omit',
+            signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(8000)]),
+          });
           if (response.ok) {
             const { data } = await response.json();
             for (const thumbnail of data || []) {
@@ -119,118 +138,867 @@
     }
   }
 
+  function detectInitialTheme() {
+    try {
+      const saved = localStorage.getItem(themeKey);
+      if (saved === 'dark' || saved === 'light') return saved;
+    } catch { /* Ignore storage errors. */ }
+    if (document.body.classList.contains('dark-theme') || document.documentElement.classList.contains('dark-theme')) return 'dark';
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
   const host = element('div', '', { id: panelId });
   const shadow = host.attachShadow({ mode: 'open' });
   const styles = new CSSStyleSheet();
   styles.replaceSync(`
-    :host { color-scheme: light; }
+    :host {
+      --bg: #ffffff;
+      --bg-elevated: #f8fafc;
+      --surface: #f1f5f9;
+      --surface-hover: #e8eef6;
+      --border: rgba(15, 23, 42, 0.09);
+      --border-strong: rgba(15, 23, 42, 0.16);
+      --text: #0f172a;
+      --text-muted: #52627a;
+      --text-subtle: #7c8ba1;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --accent-soft: rgba(37, 99, 235, 0.11);
+      --accent-glow: rgba(37, 99, 235, 0.28);
+      --accent-gradient: linear-gradient(135deg, #2563eb 0%, #4f46e5 100%);
+      --success: #16a34a;
+      --success-soft: rgba(22, 163, 74, 0.12);
+      --warn: #d97706;
+      --warn-soft: rgba(217, 119, 6, 0.13);
+      --danger: #dc2626;
+      --danger-soft: rgba(220, 38, 38, 0.12);
+      --shadow: 0 28px 70px -12px rgba(15, 23, 42, 0.34), 0 0 0 1px var(--border);
+      --backdrop: rgba(15, 23, 42, 0.56);
+      --ring: rgba(59, 130, 246, 0.45);
+      --input-bg: #ffffff;
+      --shimmer-a: rgba(148, 163, 184, 0.14);
+      --shimmer-b: rgba(148, 163, 184, 0.28);
+      --dialog-top: clamp(20px, 8vh, 68px);
+      color-scheme: light;
+    }
+
+    :host([data-theme="dark"]) {
+      --bg: #11151f;
+      --bg-elevated: #171c29;
+      --surface: #1d2434;
+      --surface-hover: #252e42;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text: #f1f5f9;
+      --text-muted: #9aa7bd;
+      --text-subtle: #6f7d96;
+      --accent: #3b82f6;
+      --accent-hover: #60a5fa;
+      --accent-soft: rgba(59, 130, 246, 0.16);
+      --accent-glow: rgba(59, 130, 246, 0.36);
+      --accent-gradient: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+      --success: #22c55e;
+      --success-soft: rgba(34, 197, 94, 0.16);
+      --warn: #f59e0b;
+      --warn-soft: rgba(245, 158, 11, 0.16);
+      --danger: #f87171;
+      --danger-soft: rgba(248, 113, 113, 0.15);
+      --shadow: 0 32px 80px -10px rgba(0, 0, 0, 0.68), 0 0 0 1px var(--border);
+      --backdrop: rgba(4, 7, 15, 0.72);
+      --ring: rgba(96, 165, 250, 0.45);
+      --input-bg: #151a26;
+      --shimmer-a: rgba(255, 255, 255, 0.05);
+      --shimmer-b: rgba(255, 255, 255, 0.13);
+      color-scheme: dark;
+    }
+
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+
+    @keyframes modalIn {
+      from { opacity: 0; transform: translateY(18px) scale(0.95); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes modalOut {
+      from { opacity: 1; transform: translateY(0) scale(1); }
+      to { opacity: 0; transform: translateY(12px) scale(0.96); }
+    }
+    @keyframes backdropIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes backdropOut {
+      from { opacity: 1; }
+      to { opacity: 0; }
+    }
+    @keyframes panelEnter {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes itemIn {
+      from { opacity: 0; transform: translateY(6px) scale(0.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    @keyframes pulseDot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.8); }
+    }
+    @keyframes popIn {
+      0% { opacity: 0; transform: scale(0.6); }
+      70% { opacity: 1; transform: scale(1.06); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    @keyframes drawStroke {
+      to { stroke-dashoffset: 0; }
+    }
+    @keyframes particleBurst {
+      0% { opacity: 1; transform: translate(0, 0) scale(1); }
+      100% { opacity: 0; transform: translate(var(--dx), var(--dy)) scale(0.2); }
+    }
+
+    .panel-enter { animation: panelEnter 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
     dialog {
-      width: min(460px, calc(100% - 32px)); max-width: none; padding: 0;
-      max-height: calc(100vh - 32px); overflow-y: auto;
-      border: 1px solid #d5dde8; border-radius: 16px; background: #fff;
-      color: #172336; font: 14px/1.5 system-ui, sans-serif;
-      box-shadow: 0 20px 64px #0f172a44;
+      position: fixed;
+      inset: 0;
+      margin: var(--dialog-top) auto auto;
+      width: min(472px, calc(100% - 28px));
+      max-width: none;
+      max-height: calc(100vh - var(--dialog-top) - 20px);
+      padding: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      border: 0;
+      border-radius: 22px;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      box-shadow: var(--shadow);
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-strong) transparent;
+      animation: modalIn 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+      transition: background-color 0.25s ease, color 0.25s ease;
     }
-    dialog::backdrop { background: #0f172aaf; }
-    header, section, form { padding: 20px 24px; }
-    header { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; }
-    header, section { border-bottom: 1px solid #e2e8f0; }
-    h2 { margin: 0; font-size: 20px; line-height: 1.3; }
-    p { margin: 4px 0 0; color: #485970; }
-    a { color: #144ea6; font-weight: 650; overflow-wrap: anywhere; }
-    label, .label { display: block; margin: 0 0 6px; font-weight: 650; }
+    dialog::before {
+      content: "";
+      position: sticky;
+      top: 0;
+      display: block;
+      height: 3px;
+      width: 100%;
+      background: var(--accent-gradient);
+      z-index: 5;
+    }
+    dialog::backdrop {
+      background: var(--backdrop);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      animation: backdropIn 0.26s ease both;
+    }
+    dialog.closing {
+      animation: modalOut 0.2s cubic-bezier(0.4, 0, 1, 1) both;
+      pointer-events: none;
+    }
+    dialog.closing::backdrop {
+      animation: backdropOut 0.2s ease both;
+    }
+
+    dialog::-webkit-scrollbar, .results::-webkit-scrollbar, .batch-list::-webkit-scrollbar { width: 6px; }
+    dialog::-webkit-scrollbar-thumb, .results::-webkit-scrollbar-thumb, .batch-list::-webkit-scrollbar-thumb {
+      background: var(--border-strong); border-radius: 999px;
+    }
+
+    header, section, form { padding: 18px 22px; }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      justify-content: space-between;
+      padding: 18px 22px 14px;
+    }
+    section { border-top: 1px solid var(--border); }
+    section.account { border-top: 0; padding-top: 4px; }
+
+    /* Downward expand / collapse drawer for Batch mode */
+    section.batch-panel {
+      display: grid;
+      grid-template-rows: 0fr;
+      padding: 0;
+      border-top: 0;
+      opacity: 0;
+      transition:
+        grid-template-rows 0.38s cubic-bezier(0.4, 0, 0.2, 1),
+        opacity 0.24s ease;
+    }
+    section.batch-panel[data-open="true"] {
+      grid-template-rows: 1fr;
+      opacity: 1;
+      transition:
+        grid-template-rows 0.48s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 0.36s ease 0.06s;
+    }
+    .batch-panel-clip {
+      min-height: 0;
+      overflow: hidden;
+    }
+    .batch-panel-inner {
+      padding: 18px 22px;
+      border-top: 1px solid var(--border);
+      transform: translateY(-16px) scale(0.985);
+      transform-origin: top center;
+      transition: transform 0.36s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    section.batch-panel[data-open="true"] .batch-panel-inner {
+      transform: translateY(0) scale(1);
+      transition: transform 0.48s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    section.batch-panel.no-transition,
+    section.batch-panel.no-transition .batch-panel-inner {
+      transition: none !important;
+    }
+
+    .brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+    .brand-badge {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: var(--accent-gradient);
+      color: #fff;
+      font-size: 19px;
+      box-shadow: 0 6px 18px var(--accent-glow);
+      flex: none;
+    }
+    .header-controls { display: flex; align-items: center; gap: 6px; }
+
+    h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; }
+    h3 { margin: 0 0 6px; font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
+    p { margin: 4px 0 0; color: var(--text-muted); }
+    a {
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+      overflow-wrap: anywhere;
+      transition: color 0.18s ease, opacity 0.18s ease;
+    }
+    a:hover { text-decoration: underline; }
+    label, .label { display: block; margin: 0 0 7px; font-size: 12.5px; font-weight: 650; color: var(--text-muted); letter-spacing: 0.01em; }
+
+    .ui-icon { width: 17px; height: 17px; flex: none; display: block; }
+
     input {
-      width: 100%; padding: 10px 12px; border: 1px solid #94a3b8;
-      border-radius: 8px; font: inherit; color: inherit; background: #fff;
+      width: 100%;
+      padding: 11px 13px;
+      border: 1.5px solid var(--border-strong);
+      border-radius: 12px;
+      font: inherit;
+      color: var(--text);
+      background: var(--input-bg);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
     }
+    input::placeholder { color: var(--text-subtle); }
+    input:hover:not(:disabled) { border-color: var(--text-subtle); }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3.5px var(--accent-soft);
+    }
+    input:disabled { opacity: 0.55; cursor: not-allowed; }
+
     button {
-      border: 1px solid #b5c1d0; border-radius: 8px; padding: 8px 13px;
-      background: #fff; color: #172336; font: inherit; font-weight: 650;
-      cursor: pointer; white-space: nowrap;
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: 1px solid var(--border-strong);
+      border-radius: 11px;
+      padding: 9px 14px;
+      background: var(--bg-elevated);
+      color: var(--text);
+      font: inherit;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: transform 0.14s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.18s ease,
+                  border-color 0.18s ease, box-shadow 0.2s ease, color 0.18s ease, opacity 0.18s ease;
     }
-    button:hover { background: #f1f5f9; }
-    .primary { background: #1456b8; border-color: #1456b8; color: white; }
-    .primary:hover { background: #11468f; }
-    :focus-visible { outline: 3px solid #60a5fa; outline-offset: 2px; }
+    button:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--text-subtle); }
+    button:active:not(:disabled) { transform: scale(0.965); }
+    button:disabled { opacity: 0.48; cursor: not-allowed; }
+
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 10px;
+      background: var(--surface);
+      border-color: transparent;
+      color: var(--text-muted);
+    }
+    .icon-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); border-color: var(--border); }
+    .close-btn:hover:not(:disabled) svg { transform: rotate(90deg); }
+    .close-btn svg { transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1); }
+
+    .primary {
+      background: var(--accent-gradient);
+      border-color: transparent;
+      color: #ffffff;
+      box-shadow: 0 6px 18px -4px var(--accent-glow);
+    }
+    .primary:hover:not(:disabled) {
+      filter: brightness(1.08);
+      box-shadow: 0 10px 24px -4px var(--accent-glow);
+      transform: translateY(-1px);
+      background: var(--accent-gradient);
+      border-color: transparent;
+    }
+    .primary:active:not(:disabled) { transform: translateY(0) scale(0.97); }
+    .primary.is-busy::before {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+
+    :focus-visible { outline: 2.5px solid var(--ring); outline-offset: 2px; }
+
+    .mode-switch-wrap { padding: 0 22px 14px; }
+    .mode-switch {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      padding: 4px;
+      border-radius: 13px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    .mode-thumb {
+      position: absolute;
+      top: 4px;
+      bottom: 4px;
+      left: 4px;
+      width: calc(50% - 4px);
+      border-radius: 9.5px;
+      background: var(--accent-gradient);
+      box-shadow: 0 4px 14px -2px var(--accent-glow);
+      transition: transform 0.34s cubic-bezier(0.34, 1.4, 0.64, 1);
+      pointer-events: none;
+    }
+    .mode-switch[data-mode="batch"] .mode-thumb { transform: translateX(100%); }
+    .mode-switch button {
+      position: relative;
+      z-index: 1;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .mode-switch button:hover:not(:disabled) { background: transparent; color: var(--text); }
+    .mode-switch button[aria-pressed="true"] { color: #ffffff; }
+
+    .account-card {
+      padding: 13px 15px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      transition: border-color 0.2s ease;
+    }
+    .account-line {
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .account-balance {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .account-balance small { font-size: 11px; font-weight: 600; opacity: 0.8; }
+
+    .allowances { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .allowance {
+      padding: 12px 13px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .allowance:hover { border-color: var(--border-strong); }
+    .allowance-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .allowance-label { margin: 0; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+    .allowance-pct { font-size: 11px; font-weight: 650; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+    .allowance-value {
+      font-size: 18px;
+      font-weight: 750;
+      color: var(--text);
+      margin: 4px 0 2px !important;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+    .allowance-value.is-loading {
+      color: transparent;
+      border-radius: 6px;
+      background: linear-gradient(90deg, var(--shimmer-a) 25%, var(--shimmer-b) 50%, var(--shimmer-a) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s infinite linear;
+      width: 72%;
+    }
+    .allowance small { display: block; font-size: 11.5px; color: var(--text-subtle); }
+    .progress-track {
+      height: 6px;
+      width: 100%;
+      margin-top: 10px;
+      border-radius: 999px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 100%;
+      border-radius: 999px;
+      background: var(--accent-gradient);
+      transform-origin: left center;
+      transform: scaleX(0);
+      transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1), background 0.3s ease;
+    }
+    .progress-fill[data-level="warn"] { background: linear-gradient(90deg, #f59e0b, #ea580c); }
+    .progress-fill[data-level="high"] { background: linear-gradient(90deg, #ef4444, #dc2626); }
+
+    .allowance-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .allowance-footer p { margin: 0; font-size: 12px; color: var(--text-subtle); }
+    .allowance-footer button { padding: 5px 10px; font-size: 12px; border-radius: 9px; }
+    .allowance-footer button.spinning svg { animation: spin 0.75s linear infinite; }
+
     .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-    .total { margin: 0; font-size: 24px; font-weight: 700; color: #172336; }
+    .total {
+      margin: 6px 0 0;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
     .status:empty { display: none; }
-    .status { margin-top: 10px; }
+    .status {
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 12.5px;
+      animation: panelEnter 0.22s ease both;
+    }
+    #robux-transfer-cooldown {
+      background: var(--warn-soft);
+      border-color: rgba(245, 158, 11, 0.28);
+      color: var(--warn);
+      font-weight: 600;
+    }
+
     .search { padding: 0; }
-    .search-row, .recipient-row { display: flex; gap: 10px; align-items: center; }
-    .search-row input, .recipient-row > div { min-width: 0; flex: 1; }
-    .results { display: grid; gap: 6px; margin-top: 10px; max-height: 240px; overflow: auto; padding: 4px; }
+    .search-row, .recipient-row { display: flex; gap: 9px; align-items: center; }
+    .search-input-wrap { position: relative; flex: 1; min-width: 0; }
+    .search-input-wrap .search-icon {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-subtle);
+      pointer-events: none;
+    }
+    .search-input-wrap input { padding-left: 36px; }
+    .recipient-row {
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+    }
+    .recipient-row > div { min-width: 0; flex: 1; }
+    .recipient-row .label { margin: 0; font-size: 11.5px; }
+
+    .results {
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+      max-height: 236px;
+      overflow-y: auto;
+      padding: 2px;
+    }
     .results:empty { display: none; }
-    .result { width: 100%; display: flex; gap: 12px; align-items: center; text-align: left; white-space: normal; overflow-wrap: anywhere; }
-    .result-names { min-width: 0; }
-    .avatar { position: relative; display: grid; place-items: center; flex: 0 0 44px; width: 44px; height: 44px; border-radius: 50%; overflow: hidden; background: #e8eef6; color: #4b607a; }
-    .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .result {
+      width: 100%;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: flex-start;
+      text-align: left;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      animation: itemIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) both;
+      animation-delay: calc(var(--i, 0) * 32ms);
+    }
+    .result:hover:not(:disabled) {
+      transform: translateX(3px);
+      border-color: var(--accent);
+      background: var(--surface);
+    }
+    .result-names { min-width: 0; font-weight: 650; }
+
+    .avatar {
+      position: relative;
+      display: grid;
+      place-items: center;
+      flex: 0 0 42px;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      overflow: hidden;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+      box-shadow: inset 0 0 0 1px var(--border);
+    }
+    .avatar img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0;
+      transition: opacity 0.28s ease;
+    }
+    .avatar img.loaded { opacity: 1; }
     .avatar-slot { display: flex; flex: none; }
-    .username { display: block; color: #485970; font-size: 13px; font-weight: 500; }
-    .fallback { display: inline-block; margin-top: 8px; }
-    button:disabled { opacity: .5; cursor: default; }
-    .notice { font-size: 13px; padding-top: 12px; }
-    .error { color: #b42318; }
-    .account { padding-top: 0; }
-    .presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-    .robux-icon { display: inline-block; width: 1em; height: 1em; flex: none; vertical-align: -.12em; }
-    .money, .presets button { display: inline-flex; align-items: center; gap: 6px; }
-    .account-line { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
-    .allowances { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
-    .allowance { padding: 12px; background: #f4f7fb; border: 1px solid #e2e8f0; border-radius: 10px; }
-    .allowance p { margin: 0; }
-    .allowance-value { font-size: 18px; font-weight: 700; color: #172336; margin: 3px 0 !important; }
-    .allowance small { display: block; color: #65758a; }
-    .allowance progress { display: block; width: 100%; height: 5px; margin: 9px 0 0; accent-color: #1456b8; }
-    .allowance-footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 9px; }
-    .allowance-footer p { margin: 0; font-size: 12px; }
-    .allowance-footer button { padding: 4px 8px; font-size: 12px; }
-    .success { padding: 24px; }
-    .success-hero { text-align: center; padding: 0 0 20px; }
-    .success-check { display: grid; place-items: center; width: 48px; height: 48px; margin: 0 auto 12px; border-radius: 50%; color: #15803d; background: #e9f7ee; font-size: 28px; font-weight: 700; }
-    .success-total { justify-content: center; color: #172336; font-size: 34px; font-weight: 750; }
-    .success-recipient { display: flex; justify-content: center; align-items: center; gap: 9px; margin-top: 12px; }
-    .success-recipient .avatar { width: 36px; height: 36px; flex-basis: 36px; }
-    .receipt { margin: 0; padding: 14px 0; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
-    .receipt-row { display: grid; grid-template-columns: 76px 1fr; gap: 12px; margin: 6px 0; }
-    .receipt-row dt { color: #65758a; }
-    .receipt-row dd { margin: 0; text-align: right; overflow-wrap: anywhere; color: #172336; }
+    .username { display: block; color: var(--text-muted); font-size: 12.5px; font-weight: 500; }
+    .fallback { display: inline-block; margin-top: 8px; font-size: 13px; }
+
+    .amount-input-wrap { position: relative; }
+    .amount-input-wrap .robux-icon {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 20px;
+      color: var(--accent);
+      pointer-events: none;
+    }
+    .amount-input-wrap input {
+      padding: 13px 14px 13px 44px;
+      font-size: 22px;
+      font-weight: 750;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+
+    .presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+    .presets button {
+      padding: 8px 6px;
+      border-radius: 10px;
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+    }
+    .presets button.is-selected {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .notice { font-size: 12.5px; margin-top: 10px; color: var(--text-subtle); }
+    .review-card {
+      padding: 16px;
+      border-radius: 16px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+    }
+    .review-card > p:first-child { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-muted); }
+
+    .robux-icon { display: inline-block; width: 1.05em; height: 1.05em; flex: none; vertical-align: -0.14em; }
+    .money, .presets button { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+
+    .success { padding: 24px 22px; }
+    .success-hero { position: relative; text-align: center; padding: 6px 0 22px; overflow: visible; }
+    .success-check {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 60px;
+      height: 60px;
+      margin: 0 auto 14px;
+      border-radius: 50%;
+      color: var(--success);
+      background: var(--success-soft);
+      box-shadow: 0 0 0 8px rgba(34, 197, 94, 0.06);
+      animation: popIn 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+    .success-check svg { width: 32px; height: 32px; }
+    .success-check .check-path {
+      stroke-dasharray: 40;
+      stroke-dashoffset: 40;
+      animation: drawStroke 0.4s 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    }
+    .burst-dot {
+      position: absolute;
+      left: 50%;
+      top: 36px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      pointer-events: none;
+      animation: particleBurst 0.72s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    .success-total {
+      justify-content: center;
+      color: var(--text);
+      font-size: 36px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      animation: panelEnter 0.35s 0.12s ease both;
+    }
+    .success-recipient {
+      display: inline-flex;
+      justify-content: center;
+      align-items: center;
+      gap: 9px;
+      margin-top: 12px;
+      padding: 6px 14px 6px 7px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      animation: panelEnter 0.35s 0.18s ease both;
+    }
+    .success-recipient .avatar { width: 30px; height: 30px; flex-basis: 30px; font-size: 12px; }
+
+    .receipt {
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+    }
+    .receipt-row { display: grid; grid-template-columns: 82px 1fr; gap: 12px; padding: 6px 0; }
+    .receipt-row + .receipt-row { border-top: 1px solid var(--border); }
+    .receipt-row dt { color: var(--text-subtle); font-size: 12.5px; }
+    .receipt-row dd {
+      margin: 0;
+      text-align: right;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
     .success .actions { flex-wrap: wrap; }
     .success .actions a { align-self: center; font-size: 13px; margin-right: auto; }
+
+    .batch-summary-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      margin: 10px 0 12px;
+      border-radius: 14px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+    }
+    .batch-summary-card .label { margin: 0; }
+    .batch-summary-card .total { margin: 0; font-size: 22px; }
+
+    .batch-list { display: grid; gap: 8px; margin-top: 10px; max-height: 290px; overflow-y: auto; padding-right: 2px; }
+    .batch-row {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: var(--bg-elevated);
+      transition: border-color 0.25s ease, background-color 0.25s ease, box-shadow 0.25s ease;
+    }
+    .batch-row.row-enter { animation: itemIn 0.26s cubic-bezier(0.22, 1, 0.36, 1) both; }
+    .batch-row[data-status="preparing"], .batch-row[data-status="sending"] {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .batch-row[data-status="submitted"] { border-color: rgba(34, 197, 94, 0.32); }
+    .batch-row[data-status="failed"], .batch-row[data-status="unconfirmed"] { border-color: rgba(248, 113, 113, 0.38); }
+    .batch-row > div { min-width: 0; flex: 1; }
+    .batch-row p { margin: 3px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+    .batch-row .money { font-size: 14.5px; font-weight: 700; }
+    .batch-row button { padding: 5px 9px; font-size: 12px; border-radius: 8px; }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 650;
+      background: var(--surface);
+      color: var(--text-muted);
+      margin-right: 4px;
+    }
+    .status-pill::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .status-pill[data-status="preparing"], .status-pill[data-status="sending"] {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+    .status-pill[data-status="preparing"]::before, .status-pill[data-status="sending"]::before {
+      animation: pulseDot 1s ease-in-out infinite;
+    }
+    .status-pill[data-status="submitted"] { background: var(--success-soft); color: var(--success); }
+    .status-pill[data-status="failed"], .status-pill[data-status="unconfirmed"] {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+    .status-pill[data-status="skipped"] { background: var(--warn-soft); color: var(--warn); }
+
+    .batch-panel .actions { flex-wrap: wrap; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   `);
   shadow.adoptedStyleSheets = [styles];
 
+  let currentTheme = detectInitialTheme();
+  host.dataset.theme = currentTheme;
+
   const dialog = element('dialog', '', { 'aria-labelledby': 'transfer-title' });
   const header = element('header');
-  const heading = element('div');
-  const closeButton = element('button', 'Close', { type: 'button' });
+  const brand = element('div', '', { class: 'brand' });
+  const brandBadge = element('div', '', { class: 'brand-badge', 'aria-hidden': 'true' });
+  brandBadge.append(robuxIcon());
   const transferTitle = element('h2', 'Send Robux', { id: 'transfer-title' });
-  heading.append(transferTitle);
-  header.append(heading, closeButton);
+  brand.append(brandBadge, transferTitle);
+
+  const headerControls = element('div', '', { class: 'header-controls' });
+  const themeButton = element('button', '', {
+    type: 'button', class: 'icon-btn', 'aria-label': 'Switch color theme', title: 'Switch color theme',
+  });
+  function renderThemeIcon() {
+    const isDark = currentTheme === 'dark';
+    themeButton.replaceChildren(isDark
+      ? svgIcon([
+          { tag: 'circle', cx: '12', cy: '12', r: '4', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' },
+          { d: 'M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linecap': 'round' },
+        ])
+      : svgIcon([
+          { d: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linejoin': 'round' },
+        ]));
+  }
+  renderThemeIcon();
+  themeButton.addEventListener('click', () => {
+    currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    host.dataset.theme = currentTheme;
+    renderThemeIcon();
+    try { localStorage.setItem(themeKey, currentTheme); } catch { /* Theme persists in memory. */ }
+  });
+
+  const closeButton = element('button', '', {
+    type: 'button', class: 'icon-btn close-btn', 'aria-label': 'Close', title: 'Close',
+  });
+  closeButton.append(svgIcon([
+    { d: 'M18 6 6 18M6 6l12 12', fill: 'none', stroke: 'currentColor', 'stroke-width': '2.2', 'stroke-linecap': 'round' },
+  ]));
+  headerControls.append(themeButton, closeButton);
+  header.append(brand, headerControls);
+
+  const modeSwitchWrap = element('div', '', { class: 'mode-switch-wrap' });
+  const modeSwitch = element('div', '', { class: 'mode-switch', 'data-mode': 'single' });
+  const modeThumb = element('span', '', { class: 'mode-thumb', 'aria-hidden': 'true' });
+  const singleModeButton = element('button', 'Single recipient', { type: 'button', 'aria-pressed': 'true' });
+  const batchModeButton = element('button', 'Batch transfer', { type: 'button', 'aria-pressed': 'false' });
+  modeSwitch.append(modeThumb, singleModeButton, batchModeButton);
+  modeSwitchWrap.append(modeSwitch);
 
   const accountSection = element('section', '', { class: 'account' });
+  const accountCard = element('div', '', { class: 'account-card' });
   const accountLabel = element('p', 'Checking your signed-in Roblox account…');
+  accountCard.append(accountLabel);
   const accountStatus = element('p', '', { class: 'status', role: 'status' });
+  const cooldownNote = element('p', '', { id: 'robux-transfer-cooldown', class: 'status', role: 'status', hidden: '' });
   const reloadButton = element('button', 'Reload account', { type: 'button', hidden: '' });
   const allowanceGrid = element('div', '', { class: 'allowances' });
+
   function allowanceCard(label) {
     const card = element('div', '', { class: 'allowance' });
-    const value = element('p', 'Loading…', { class: 'allowance-value money' });
-    const cap = element('small');
-    const progress = element('progress', '', { max: '1', value: '0', 'aria-label': label + ' used' });
-    card.append(element('p', label), value, cap, progress);
+    const top = element('div', '', { class: 'allowance-top' });
+    const title = element('p', label, { class: 'allowance-label' });
+    const pct = element('span', '', { class: 'allowance-pct' });
+    top.append(title, pct);
+    const value = element('p', 'Loading…', { class: 'allowance-value money is-loading' });
+    const cap = element('small', 'Checking allowance');
+    const track = element('div', '', { class: 'progress-track', hidden: '' });
+    const fill = element('div', '', { class: 'progress-fill' });
+    track.append(fill);
+    const progress = element('progress', '', { max: '1', value: '0', 'aria-label': label + ' used', class: 'sr-only' });
+    card.append(top, value, cap, track, progress);
     allowanceGrid.append(card);
-    return { value, cap, progress };
+    return { value, cap, progress, track, fill, pct };
   }
   const dailyAllowance = allowanceCard('Daily remaining');
   const monthlyAllowance = allowanceCard('Monthly remaining');
   const allowanceFooter = element('div', '', { class: 'allowance-footer' });
   const allowanceNote = element('p', 'History estimate · last 24h / 30 days', { role: 'status' });
-  const refreshAllowanceButton = element('button', 'Refresh', { type: 'button', 'aria-label': 'Refresh balance and allowances' });
+  const refreshAllowanceButton = element('button', '', { type: 'button', 'aria-label': 'Refresh balance and allowances' });
+  refreshAllowanceButton.append(
+    svgIcon([
+      { d: 'M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    ]),
+    element('span', 'Refresh'),
+  );
   allowanceFooter.append(allowanceNote, refreshAllowanceButton);
-  accountSection.append(accountLabel, allowanceGrid, allowanceFooter, accountStatus, reloadButton);
+  accountSection.append(accountCard, allowanceGrid, allowanceFooter, accountStatus, cooldownNote, reloadButton);
 
   const recipientSection = element('section');
   const searchForm = element('form', '', { class: 'search', role: 'search' });
@@ -238,12 +1006,20 @@
     id: 'recipient-search', type: 'text', placeholder: '@username or profile link',
     required: '', autocomplete: 'off', maxlength: '300',
   });
+  const searchInputWrap = element('div', '', { class: 'search-input-wrap' });
+  searchInputWrap.append(
+    svgIcon([
+      { tag: 'circle', cx: '11', cy: '11', r: '7', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' },
+      { d: 'm20 20-3.5-3.5', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linecap': 'round' },
+    ], 'ui-icon search-icon'),
+    searchField,
+  );
   const searchRow = element('div', '', { class: 'search-row' });
-  searchRow.append(searchField, element('button', 'Search', { type: 'submit', class: 'primary' }));
+  searchRow.append(searchInputWrap, element('button', 'Search', { type: 'submit', class: 'primary' }));
   const searchStatus = element('p', '', { class: 'status', role: 'status' });
   const searchResults = element('div', '', { id: 'recipient-suggestions', class: 'results', 'aria-label': 'Matching Roblox users' });
   searchField.setAttribute('aria-controls', 'recipient-suggestions');
-  const peopleSearchLink = element('a', 'Open Roblox People search', {
+  const peopleSearchLink = element('a', 'Open Roblox People search ↗', {
     class: 'fallback', target: '_blank', rel: 'noopener noreferrer', hidden: '',
   });
   searchForm.append(element('label', 'Find recipient', { for: 'recipient-search' }), searchRow,
@@ -263,17 +1039,27 @@
     id: 'robux-amount', name: 'amount', type: 'number', min: '10', step: '1',
     required: '', inputmode: 'numeric', placeholder: '100',
   });
+  const amountInputWrap = element('div', '', { class: 'amount-input-wrap' });
+  amountInputWrap.append(robuxIcon(), amount);
   const editFields = element('div');
   const editActions = element('div', '', { class: 'actions' });
   const reviewButton = element('button', 'Review transfer', { type: 'submit', class: 'primary' });
   reviewButton.disabled = true;
   const presets = element('div', '', { class: 'presets' });
+
+  function syncPresetHighlight() {
+    for (const btn of presets.children) {
+      btn.classList.toggle('is-selected', amount.value === btn.dataset.value);
+    }
+  }
+
   for (const value of [25, 50, 100, 200]) {
-    const preset = element('button', String(value), { type: 'button' });
+    const preset = element('button', String(value), { type: 'button', 'data-value': String(value) });
     showRobux(preset, value);
     preset.addEventListener('click', () => {
       amount.value = String(value);
       amount.setCustomValidity('');
+      syncPresetHighlight();
       amount.focus();
     });
     presets.append(preset);
@@ -281,33 +1067,36 @@
   const limitsLabel = element('p', '', { class: 'notice' });
   const prepareStatus = element('p', '', { class: 'status', role: 'status' });
   editActions.append(reviewButton);
-  editFields.append(element('label', 'Amount in Robux', { for: 'robux-amount' }), amount,
+  editFields.append(element('label', 'Amount in Robux', { for: 'robux-amount' }), amountInputWrap,
     presets, limitsLabel, prepareStatus, editActions);
 
   const review = element('div', '', { hidden: '' });
+  const reviewCard = element('div', '', { class: 'review-card' });
   const total = element('p', '', { class: 'total money' });
   const status = element('p', '', { class: 'status', role: 'status' });
   const reviewActions = element('div', '', { class: 'actions' });
   const editButton = element('button', 'Edit amount', { type: 'button' });
   const sendButton = element('button', 'Send Robux', { type: 'button', class: 'primary' });
   const reviewedRecipient = element('p');
-  const transactionsLink = element('a', 'Open My Transactions', {
-    href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer', hidden: '',
+  const transactionsLink = element('a', 'Open My Transactions ↗', {
+    href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer', hidden: '', class: 'fallback',
   });
   const acknowledgedButton = element('button', 'I checked My Transactions', { type: 'button', hidden: '' });
   const newTransferButton = element('button', 'New transfer', { type: 'button', hidden: '' });
   reviewActions.append(editButton, sendButton);
-  review.append(reviewedRecipient, total,
+  reviewCard.append(reviewedRecipient, total);
+  review.append(reviewCard,
     element('p', 'Confirm the @username and amount. Transfers are final.', { class: 'notice' }),
     reviewActions, status, transactionsLink, acknowledgedButton, newTransferButton);
   form.append(editFields, review);
 
   const successPanel = element('section', '', { class: 'success', hidden: '' });
   const successHero = element('div', '', { class: 'success-hero' });
+  const successCheck = element('div', '', { class: 'success-check', 'aria-hidden': 'true' });
   const successAmount = element('div', '', { class: 'success-total money' });
   const successRecipient = element('div', '', { class: 'success-recipient' });
-  successHero.append(element('div', '✓', { class: 'success-check', 'aria-hidden': 'true' }),
-    successAmount, successRecipient);
+  successHero.append(successCheck, successAmount, successRecipient);
+
   const receipt = element('dl', '', { class: 'receipt' });
   function receiptRow(label) {
     const row = element('div', '', { class: 'receipt-row' });
@@ -320,7 +1109,7 @@
   const receiptTime = receiptRow('Time');
   const receiptReference = receiptRow('Reference');
   const successActions = element('div', '', { class: 'actions' });
-  const successTransactions = element('a', 'View transactions', {
+  const successTransactions = element('a', 'View transactions ↗', {
     href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer',
   });
   const copyReceiptButton = element('button', 'Copy receipt', { type: 'button' });
@@ -329,7 +1118,39 @@
   successActions.append(successTransactions, copyReceiptButton, newTransferButton);
   const receiptStatus = element('p', '', { role: 'status', class: 'status' });
   successPanel.append(successHero, receipt, successActions, receiptStatus);
-  dialog.append(header, accountSection, recipientSection, form, successPanel);
+
+  const batchPanel = element('section', '', {
+    id: 'robux-batch-panel', class: 'batch-panel', 'data-open': 'false', 'aria-hidden': 'true',
+  });
+  batchPanel.inert = true;
+  const batchPanelClip = element('div', '', { class: 'batch-panel-clip' });
+  const batchPanelInner = element('div', '', { class: 'batch-panel-inner' });
+  const batchSummary = element('p', 'Add up to 50 recipients.', { id: 'robux-batch-summary', role: 'status' });
+  const batchSummaryCard = element('div', '', { class: 'batch-summary-card' });
+  const batchTotalLabel = element('p', 'Total remaining', { class: 'label' });
+  const batchTotal = element('p', '', { id: 'robux-batch-total', class: 'total money' });
+  batchSummaryCard.append(batchTotalLabel, batchTotal);
+  const batchList = element('div', '', { id: 'robux-batch-list', class: 'batch-list' });
+  const batchNotice = element('p', 'Review every @username and amount. Each row is a separate personal transfer. Submitted transfers are final.', { class: 'notice' });
+  const batchStatus = element('p', '', { id: 'robux-batch-status', class: 'status', role: 'status' });
+  const batchActions = element('div', '', { class: 'actions' });
+  const batchReviewButton = element('button', 'Review batch', { type: 'button', class: 'primary' });
+  const batchEditButton = element('button', 'Edit batch', { type: 'button', hidden: '' });
+  const batchSendButton = element('button', 'Send batch', { type: 'button', class: 'primary', hidden: '' });
+  const batchCancelButton = element('button', 'Cancel remaining', { type: 'button', hidden: '' });
+  const batchResumeButton = element('button', 'Resume remaining', { type: 'button', hidden: '' });
+  const batchNewButton = element('button', 'New batch', { type: 'button', hidden: '' });
+  const batchAcknowledgeButton = element('button', 'I checked batch transactions', { type: 'button', hidden: '' });
+  const batchTransactionsLink = element('a', 'View batch transactions ↗', {
+    href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer', hidden: '', class: 'fallback',
+  });
+  batchActions.append(batchEditButton, batchReviewButton, batchSendButton, batchCancelButton,
+    batchResumeButton, batchAcknowledgeButton, batchNewButton);
+  batchPanelInner.append(element('h3', 'Recipients'), batchSummary, batchSummaryCard, batchList,
+    batchNotice, batchStatus, batchTransactionsLink, batchActions);
+  batchPanelClip.append(batchPanelInner);
+  batchPanel.append(batchPanelClip);
+  dialog.append(header, modeSwitchWrap, accountSection, recipientSection, form, successPanel, batchPanel);
   shadow.append(dialog);
 
   let recipient;
@@ -340,24 +1161,81 @@
   let resultSignal;
   let usageTransfers = [];
   let usageReady = false;
+  const usageCacheVersion = 2;
   let usageRequest;
+  let statsRequest;
+  let statsRequestRevision;
+  let statsRevision = 0;
+  const statsRefreshTimers = new Set();
   let acceptedTransfers = [];
   let lastReceipt;
   let account;
   let limits;
   let balance;
+  let balanceEstimated = false;
   let prepared;
   let busy = false;
   let locked = false;
+  let batchMode = false;
+  let batchRows = [];
+  let batchPhase = 'draft';
+  let batchSenderId;
+  let batchSnapshot;
+  let batchRunning = false;
+  let batchCancelRequested = false;
+  let batchNextRecipientAt = 0;
+  let batchWaitTimer;
+  let batchWaitResolve;
+  let batchStatsDirty = false;
+  const animatedBatchIds = new Set();
+  const batchRecipientGapMs = 10000;
+  const apiCooldownKey = 'robux-transfer-api-cooldown';
+  let apiCooldownUntil = 0;
+  let apiCooldownTimer;
+  try {
+    const savedCooldown = Number(sessionStorage.getItem(apiCooldownKey));
+    if (Number.isFinite(savedCooldown) && savedCooldown > Date.now()) apiCooldownUntil = savedCooldown;
+  } catch { /* Keep rate-limit state in memory if storage is unavailable. */ }
+  const batchKey = 'robux-transfer-popup-batch';
   let csrfToken = document.querySelector('meta[name="csrf-token"]')?.dataset.token || '';
   const pendingKey = 'robux-transfer-popup-pending';
   const profileLookups = new AbortController();
   const previousFocus = document.activeElement;
   host._transferPopup = { focus: () => dialog.focus() };
-  closeButton.addEventListener('click', () => { if (!busy) dialog.close(); });
-  dialog.addEventListener('cancel', (event) => { if (busy) event.preventDefault(); });
+
+  function setBatchDrawerOpen(open, instant = false) {
+    if (instant) batchPanel.classList.add('no-transition');
+    batchPanel.dataset.open = open ? 'true' : 'false';
+    batchPanel.inert = !open;
+    batchPanel.setAttribute('aria-hidden', String(!open));
+    if (instant) {
+      void batchPanel.offsetHeight;
+      batchPanel.classList.remove('no-transition');
+    }
+  }
+
+  function closeDialogAnimated() {
+    if (busy || dialog.classList.contains('closing')) return;
+    dialog.classList.add('closing');
+    const finish = () => {
+      dialog.classList.remove('closing');
+      if (dialog.open) dialog.close();
+    };
+    dialog.addEventListener('animationend', finish, { once: true });
+    setTimeout(finish, 240);
+  }
+
+  closeButton.addEventListener('click', closeDialogAnimated);
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (!busy) closeDialogAnimated();
+  });
   dialog.addEventListener('close', () => {
+    batchCancelRequested = true;
     clearSearch();
+    clearStatsRefreshTimers();
+    clearTimeout(apiCooldownTimer);
+    releaseBatchWait();
     profileLookups.abort();
     host.remove();
     if (previousFocus?.isConnected) previousFocus.focus();
@@ -365,16 +1243,31 @@
 
   function setBusy(value) {
     busy = value;
+    const coolingDown = Date.now() < apiCooldownUntil;
     closeButton.disabled = value;
     changeRecipientButton.disabled = value || locked;
     editButton.disabled = value || locked;
-    sendButton.disabled = value || locked || !prepared;
-    reviewButton.disabled = value || locked || !account || !limits;
-    reloadButton.disabled = value;
+    sendButton.disabled = value || locked || coolingDown || !prepared;
+    reviewButton.disabled = value || locked || coolingDown || !account || !limits;
+    reloadButton.disabled = value || coolingDown;
     amount.disabled = value;
     for (const button of presets.children) button.disabled = value;
     newTransferButton.disabled = value;
-    refreshAllowanceButton.disabled = value || Boolean(usageRequest);
+    const refreshing = Boolean(usageRequest) || Boolean(statsRequest);
+    refreshAllowanceButton.disabled = value || coolingDown || refreshing;
+    refreshAllowanceButton.classList.toggle('spinning', refreshing);
+    singleModeButton.disabled = value || locked;
+    batchModeButton.disabled = value || locked;
+    batchReviewButton.disabled = value || locked || coolingDown || !batchRows.length || !account || !limits;
+    batchSendButton.disabled = value || locked || coolingDown || !batchSnapshot;
+    batchResumeButton.disabled = value || locked || coolingDown || !account || !limits;
+    batchEditButton.disabled = value || locked;
+    batchNewButton.disabled = value || locked;
+    batchAcknowledgeButton.disabled = value;
+    batchCancelButton.disabled = !batchRunning || batchCancelRequested;
+    reviewButton.classList.toggle('is-busy', value && !reviewButton.hidden && editFields && !editFields.hidden);
+    sendButton.classList.toggle('is-busy', value && !sendButton.hidden && !review.hidden);
+    batchSendButton.classList.toggle('is-busy', value && batchRunning);
   }
 
   function describeError(response, data) {
@@ -387,7 +1280,450 @@
     return 'Roblox returned HTTP ' + response.status + '. ' + (detail || 'Check your transfer eligibility.');
   }
 
+  function remainingBatchRows() {
+    return batchRows.filter((row) => row.status === 'waiting' || row.status === 'failed');
+  }
+
+  function hasUnknownBatchRow() {
+    return batchRows.some((row) => row.status === 'unconfirmed' || row.status === 'sending');
+  }
+
+  function saveBatch() {
+    sessionStorage.setItem(batchKey, JSON.stringify({
+      version: 1, senderId: batchSenderId, phase: batchPhase, rows: batchRows, nextRecipientAt: batchNextRecipientAt,
+    }));
+  }
+
+  function releaseBatchWait() {
+    clearTimeout(batchWaitTimer);
+    batchWaitTimer = null;
+    const resolve = batchWaitResolve;
+    batchWaitResolve = null;
+    if (resolve) resolve();
+  }
+
+  function waitForBatchTurn() {
+    if (batchCancelRequested || Date.now() >= batchNextRecipientAt) return Promise.resolve();
+    return new Promise((resolve) => {
+      batchWaitResolve = resolve;
+      const tick = () => {
+        const remaining = batchNextRecipientAt - Date.now();
+        if (batchCancelRequested || profileLookups.signal.aborted || remaining <= 0) {
+          releaseBatchWait();
+          return;
+        }
+        batchStatus.textContent = 'Waiting ' + Math.ceil(remaining / 1000) + 's before the next recipient…';
+        batchWaitTimer = setTimeout(tick, Math.min(1000, remaining));
+      };
+      tick();
+    });
+  }
+
+  function refreshBatchStatsWhenReady() {
+    if (!batchStatsDirty || batchRunning || !account || profileLookups.signal.aborted || Date.now() < apiCooldownUntil) return;
+    batchStatsDirty = false;
+    refreshAccountStats();
+  }
+
+  function updateCooldownStatus() {
+    clearTimeout(apiCooldownTimer);
+    if (profileLookups.signal.aborted) return;
+    const remaining = apiCooldownUntil - Date.now();
+    cooldownNote.hidden = remaining <= 0;
+    if (remaining > 0) {
+      cooldownNote.textContent = 'Roblox cooldown · wait ' + Math.ceil(remaining / 1000) + 's before resuming.';
+      apiCooldownTimer = setTimeout(updateCooldownStatus, Math.min(1000, remaining));
+    } else {
+      const expired = apiCooldownUntil > 0;
+      apiCooldownUntil = 0;
+      cooldownNote.textContent = '';
+      try { sessionStorage.removeItem(apiCooldownKey); } catch { /* Expired timestamps are ignored on reopen. */ }
+      if (expired && !account && !busy && !locked && !reloadButton.hidden) loadAccount();
+      refreshBatchStatsWhenReady();
+    }
+    setBusy(busy);
+  }
+
+  function cooldownError(retryAt = apiCooldownUntil) {
+    const error = new Error('Roblox cooldown is active. Wait ' + Math.max(1, Math.ceil((retryAt - Date.now()) / 1000)) + 's before trying again.');
+    error.status = 429;
+    error.rateLimited = true;
+    error.retryAt = retryAt;
+    error.definitelyRejected = true;
+    return error;
+  }
+
+  function rememberApiCooldown(response) {
+    const retryAfter = response.headers.get('retry-after');
+    const seconds = retryAfter == null || retryAfter.trim() === '' ? NaN : Number(retryAfter);
+    const date = Number.isFinite(seconds) ? NaN : Date.parse(retryAfter);
+    const deadline = Number.isFinite(seconds) && seconds >= 0 ? Date.now() + seconds * 1000
+      : Number.isFinite(date) ? date : Date.now() + 60000;
+    apiCooldownUntil = Math.max(apiCooldownUntil, Date.now() + 1000, deadline);
+    try { sessionStorage.setItem(apiCooldownKey, String(apiCooldownUntil)); } catch { /* Respect the cooldown in memory. */ }
+    updateCooldownStatus();
+    return apiCooldownUntil;
+  }
+
+  function resetRecipientEditor() {
+    prepared = null;
+    recipient = null;
+    selectedRecipient.hidden = true;
+    searchForm.hidden = false;
+    form.hidden = true;
+    review.hidden = true;
+    editFields.hidden = false;
+    amount.value = '';
+    syncPresetHighlight();
+    searchField.value = '';
+    clearSearch();
+  }
+
+  function renderBatch(instant = false) {
+    modeSwitch.dataset.mode = batchMode ? 'batch' : 'single';
+    singleModeButton.setAttribute('aria-pressed', String(!batchMode));
+    batchModeButton.setAttribute('aria-pressed', String(batchMode));
+    reviewButton.textContent = batchMode ? 'Add to batch' : 'Review transfer';
+    if (!batchMode) {
+      setBatchDrawerOpen(false, instant);
+      return;
+    }
+    const counts = {};
+    for (const row of batchRows) counts[row.status] = (counts[row.status] || 0) + 1;
+    const remaining = remainingBatchRows();
+    batchSummary.textContent = batchRows.length ? batchRows.length + ' recipients · '
+      + (counts.submitted || 0) + ' submitted · ' + (counts.failed || 0) + ' failed · '
+      + (counts.unconfirmed || 0) + ' unconfirmed · ' + remaining.length + ' remaining'
+      + (counts.skipped ? ' · ' + counts.skipped + ' skipped' : '')
+      : 'Add up to 50 recipients using the search above.';
+    batchTotalLabel.textContent = batchPhase === 'complete' ? 'Total submitted' : 'Total remaining';
+    const totalRows = batchPhase === 'complete' ? batchRows.filter((row) => row.status === 'submitted') : remaining;
+    showRobux(batchTotal, totalRows.reduce((sum, row) => sum + row.amount, 0));
+    batchList.replaceChildren();
+    const avatars = [];
+    const labels = {
+      waiting: 'Waiting', preparing: 'Preparing', sending: 'Sending', submitted: 'Submitted',
+      failed: 'Failed', unconfirmed: 'Unconfirmed — check transactions', skipped: 'Skipped',
+    };
+    for (const row of batchRows) {
+      const isNew = !animatedBatchIds.has(row.recipientId);
+      animatedBatchIds.add(row.recipientId);
+      const item = element('div', '', {
+        class: isNew ? 'batch-row row-enter' : 'batch-row',
+        'data-user-id': String(row.recipientId),
+        'data-status': row.status,
+      });
+      const avatar = createAvatar(row.recipientId, row.username);
+      avatars.push(avatar);
+      const details = element('div');
+      const link = element('a', '@' + row.username, {
+        href: robloxWebsite + '/users/' + row.recipientId + '/profile',
+        target: '_blank', rel: 'noopener noreferrer',
+      });
+      const meta = element('p');
+      meta.append(element('span', labels[row.status] || row.status, { class: 'status-pill', 'data-status': row.status }));
+      if (row.reference || row.error) {
+        meta.append(document.createTextNode((row.reference ? row.reference : '') + (row.error ? (row.reference ? ' · ' : '') + row.error : '')));
+      }
+      details.append(link, meta);
+      const money = element('span', '', { class: 'money' });
+      showRobux(money, row.amount);
+      item.append(avatar, details, money);
+      if (batchPhase === 'draft' && (row.status === 'waiting' || row.status === 'failed')) {
+        const remove = element('button', 'Remove', { type: 'button', 'aria-label': 'Remove @' + row.username });
+        remove.disabled = busy;
+        remove.addEventListener('click', () => {
+          if (busy || locked || batchPhase !== 'draft') return;
+          animatedBatchIds.delete(row.recipientId);
+          batchRows = batchRows.filter((entry) => entry !== row);
+          try { saveBatch(); } catch { batchStatus.textContent = 'Could not save the batch. Try again before sending.'; }
+          renderBatch();
+        });
+        item.append(remove);
+      }
+      batchList.append(item);
+    }
+    if (avatars.length) loadAvatars(avatars, profileLookups.signal);
+    recipientSection.hidden = batchPhase !== 'draft';
+    if (batchPhase !== 'draft') form.hidden = true;
+    batchReviewButton.hidden = batchPhase !== 'draft';
+    batchEditButton.hidden = batchPhase !== 'review';
+    batchSendButton.hidden = batchPhase !== 'review';
+    batchCancelButton.hidden = !batchRunning;
+    batchResumeButton.hidden = batchPhase !== 'paused' || !remaining.length || hasUnknownBatchRow();
+    batchAcknowledgeButton.hidden = !hasUnknownBatchRow();
+    batchNewButton.hidden = !batchRows.length || batchPhase === 'review' || batchRunning;
+    batchTransactionsLink.hidden = !batchRows.some((row) => row.reference);
+    transferTitle.textContent = batchRunning ? 'Sending batch' : batchPhase === 'complete'
+      ? batchRows.every((row) => row.status === 'submitted') ? 'Batch submitted' : 'Batch finished' : 'Batch transfer';
+    setBatchDrawerOpen(true, instant);
+    setBusy(busy);
+  }
+
+  function setBatchMode(value) {
+    if (busy || locked || (batchMode === value && successPanel.hidden)) return;
+    batchMode = value;
+    successPanel.hidden = true;
+    resetRecipientEditor();
+    recipientSection.hidden = false;
+    transferTitle.textContent = value ? 'Batch transfer' : 'Send Robux';
+    renderBatch();
+    setBusy(false);
+    searchField.focus();
+  }
+  singleModeButton.addEventListener('click', () => setBatchMode(false));
+  batchModeButton.addEventListener('click', () => setBatchMode(true));
+
+  function batchAllowance(cap, days) {
+    if (!usageReady || !Number.isSafeInteger(cap) || cap < 0) return null;
+    const transfers = reconcileUsageTransfers();
+    const since = Date.now() - days * 86400000;
+    return Math.max(0, cap - transfers.reduce((sum, row) => row.createdMs > since ? sum + row.amount : sum, 0));
+  }
+
+  async function validateBatch(rows, fresh = false) {
+    if (!account || !limits) throw new Error('Load your account before reviewing the batch.');
+    if (batchSenderId !== account.id) throw new Error('This batch belongs to a different sender. Start a new batch.');
+    if (hasUnknownBatchRow()) throw new Error('Check the unconfirmed transfer in My Transactions first.');
+    if (fresh) {
+      const [user, currency, transferLimits] = await Promise.all([
+        api(usersApi + '/authenticated'), api('https://economy.roblox.com/v1/user/currency'),
+        api(transferApi + '/user-transfer-limit'),
+      ]);
+      if (user.id !== batchSenderId) throw new Error('Your signed-in account changed. Reload the page.');
+      if (!Number.isSafeInteger(currency.robux) || currency.robux < 0 ||
+          !Number.isSafeInteger(transferLimits.perTransferLimit) || transferLimits.perTransferLimit < 10) {
+        throw new Error('Roblox did not provide current balance and transfer limits.');
+      }
+      balance = currency.robux;
+      balanceEstimated = false;
+      limits = transferLimits;
+      updateAccountDisplay();
+      await refreshUsage(true);
+    }
+    if (!rows.length || rows.length > 50) throw new Error('Add between 1 and 50 recipients.');
+    const ids = new Set();
+    let sum = 0;
+    for (const row of rows) {
+      if (!Number.isSafeInteger(row.recipientId) || row.recipientId <= 0 || row.recipientId === batchSenderId ||
+          typeof row.username !== 'string' || !row.username || ids.has(row.recipientId)) {
+        throw new Error('Every recipient must be verified, unique, and different from your own account.');
+      }
+      if (!Number.isSafeInteger(row.amount) || row.amount < 10 || row.amount > limits.perTransferLimit) {
+        throw new Error('Each amount must be 10–' + limits.perTransferLimit + ' whole Robux.');
+      }
+      ids.add(row.recipientId);
+      sum += row.amount;
+    }
+    if (!Number.isSafeInteger(sum) || sum > balance) throw new Error('The batch total exceeds your available balance.');
+    const daily = batchAllowance(limits.dailyLimit, 1);
+    const monthly = batchAllowance(limits.monthlyLimit, 30);
+    if (daily !== null && sum > daily) throw new Error('The batch total exceeds your daily remaining allowance.');
+    if (monthly !== null && sum > monthly) throw new Error('The batch total exceeds your monthly remaining allowance.');
+    return { balance, daily, monthly, perTransfer: limits.perTransferLimit };
+  }
+
+  async function addBatchRecipient(value) {
+    if (batchPhase !== 'draft' || batchRows.length >= 50) throw new Error('A batch can contain up to 50 recipients.');
+    const target = await api(usersApi + '/' + recipient.userId);
+    if (String(target.id) !== recipient.userId || !target.name) throw new Error('Could not verify the recipient.');
+    if (target.id === account.id) throw new Error('Choose a recipient other than your own account.');
+    if (batchRows.some((row) => row.recipientId === target.id)) throw new Error('That recipient is already in this batch.');
+    if (batchRows.length && batchSenderId !== account.id) throw new Error('This batch belongs to a different sender. Start a new batch.');
+    batchSenderId = account.id;
+    batchRows.push({ recipientId: target.id, username: target.name, amount: value, status: 'waiting' });
+    saveBatch();
+    resetRecipientEditor();
+    batchStatus.textContent = 'Recipient added. Add another, or review the batch.';
+    renderBatch();
+    searchField.focus();
+  }
+
+  async function reviewBatch() {
+    if (busy || locked || batchRunning) return;
+    if (Date.now() < apiCooldownUntil) { updateCooldownStatus(); return; }
+    setBusy(true);
+    batchStatus.textContent = 'Checking the batch total and your account…';
+    try {
+      const rows = remainingBatchRows();
+      await validateBatch(rows);
+      batchSnapshot = Object.freeze(rows.map((row) => Object.freeze({
+        recipientId: row.recipientId, username: row.username, amount: row.amount,
+      })));
+      batchPhase = 'review';
+      saveBatch();
+      batchStatus.textContent = 'Review every recipient and the total. Click Send batch to submit these transfers.';
+      resetRecipientEditor();
+    } catch (error) {
+      batchSnapshot = null;
+      batchStatus.textContent = error.message;
+    } finally {
+      setBusy(false);
+      renderBatch();
+    }
+  }
+  batchReviewButton.addEventListener('click', reviewBatch);
+  batchResumeButton.addEventListener('click', reviewBatch);
+  batchEditButton.addEventListener('click', () => {
+    if (busy || locked) return;
+    batchPhase = 'draft';
+    batchSnapshot = null;
+    try { saveBatch(); } catch { batchStatus.textContent = 'Could not save the batch. Try again before sending.'; }
+    resetRecipientEditor();
+    renderBatch();
+  });
+
+  batchCancelButton.addEventListener('click', () => {
+    if (!batchRunning) return;
+    batchCancelRequested = true;
+    releaseBatchWait();
+    batchCancelButton.disabled = true;
+    batchStatus.textContent = 'Stopping after the current recipient. Remaining recipients will not be sent.';
+  });
+
+  batchSendButton.addEventListener('click', async () => {
+    if (busy || locked || batchRunning || batchPhase !== 'review' || !batchSnapshot) return;
+    if (Date.now() < apiCooldownUntil) { updateCooldownStatus(); return; }
+    const snapshot = batchSnapshot;
+    batchRunning = true;
+    batchCancelRequested = false;
+    batchStatsDirty = true;
+    clearStatsRefreshTimers();
+    statsRevision++;
+    setBusy(true);
+    try {
+      if (statsRequest) await statsRequest;
+      if (usageRequest) await usageRequest;
+      const budget = await validateBatch(snapshot, true);
+      batchPhase = 'running';
+      saveBatch();
+      renderBatch();
+      for (const transfer of snapshot) {
+        await waitForBatchTurn();
+        if (batchCancelRequested || profileLookups.signal.aborted) break;
+        const row = batchRows.find((entry) => entry.recipientId === transfer.recipientId);
+        if (!row || (row.status !== 'waiting' && row.status !== 'failed')) throw new Error('The reviewed batch changed. Review it again.');
+        let processing = false;
+        let accepted = false;
+        try {
+          if (transfer.amount > budget.balance || transfer.amount > budget.perTransfer ||
+              (budget.daily !== null && transfer.amount > budget.daily) ||
+              (budget.monthly !== null && transfer.amount > budget.monthly)) throw new Error('The remaining batch exceeds the available balance or allowance.');
+          row.status = 'preparing';
+          row.error = '';
+          saveBatch();
+          renderBatch();
+          if (batchCancelRequested) { row.status = 'waiting'; saveBatch(); break; }
+          const initiated = await api(transferApi + '/initiate-transfer', { transferOrigin: 1, recipientId: transfer.recipientId });
+          if (typeof initiated.transferRequestId !== 'string' || !initiated.transferRequestId) throw new Error('Roblox did not provide a transfer request ID.');
+          if (batchCancelRequested) { row.status = 'waiting'; saveBatch(); break; }
+          const currentUser = await api(usersApi + '/authenticated');
+          if (currentUser.id !== batchSenderId) throw new Error('Your signed-in account changed. Reload the page.');
+          if (batchCancelRequested) { row.status = 'waiting'; saveBatch(); break; }
+          row.reference = initiated.transferRequestId;
+          row.status = 'sending';
+          saveBatch();
+          sessionStorage.setItem(pendingKey, JSON.stringify({
+            ...transfer, id: row.reference, senderId: batchSenderId, batch: true,
+          }));
+          locked = true;
+          renderBatch();
+          processing = true;
+          await api(transferApi + '/process-transfer/' + encodeURIComponent(row.reference),
+            { robuxAmount: transfer.amount }, { processing: true });
+          accepted = true;
+          row.status = 'submitted';
+          batchNextRecipientAt = Date.now() + batchRecipientGapMs;
+          saveBatch();
+          sessionStorage.removeItem(pendingKey);
+          locked = false;
+          acceptedTransfers.push({ id: row.reference, recipientId: transfer.recipientId, amount: transfer.amount, createdMs: Date.now() });
+          displayAllowances();
+          budget.balance -= transfer.amount;
+          if (budget.daily !== null) budget.daily -= transfer.amount;
+          if (budget.monthly !== null) budget.monthly -= transfer.amount;
+          balance = budget.balance;
+          balanceEstimated = true;
+          updateAccountDisplay();
+          refreshAfterSend();
+          batchStatus.textContent = 'Submitted ' + transfer.amount + ' Robux to @' + transfer.username + '.';
+          renderBatch();
+        } catch (error) {
+          const unknown = accepted || (processing && !error.definitelyRejected);
+          row.status = unknown ? 'unconfirmed' : 'failed';
+          row.error = unknown ? 'Check My Transactions before continuing. This row will never be retried.' : error.message;
+          locked = unknown;
+          try { saveBatch(); if (!unknown) sessionStorage.removeItem(pendingKey); } catch {
+            locked = true;
+            row.status = 'unconfirmed';
+            row.error = 'Could not save the result. Check My Transactions before continuing.';
+          }
+          batchStatus.textContent = 'Batch paused. ' + row.error;
+          break;
+        }
+      }
+      batchPhase = remainingBatchRows().length || hasUnknownBatchRow() ? 'paused' : 'complete';
+      if (batchPhase === 'complete') batchStatus.textContent = 'Batch finished. Each submitted transfer has its own reference.';
+      else if (batchCancelRequested) batchStatus.textContent = 'Batch stopped. Review remaining recipients before sending again.';
+      saveBatch();
+    } catch (error) {
+      batchPhase = 'paused';
+      batchStatus.textContent = 'Batch paused. ' + error.message;
+      try { saveBatch(); } catch { /* Keep the reviewed queue visible; no further transfer is submitted. */ }
+    } finally {
+      batchRunning = false;
+      releaseBatchWait();
+      batchSnapshot = null;
+      locked = hasUnknownBatchRow();
+      setBusy(false);
+      renderBatch();
+      refreshBatchStatsWhenReady();
+    }
+  });
+
+  batchAcknowledgeButton.addEventListener('click', () => {
+    if (busy || batchRunning) return;
+    const previousRows = batchRows.map((row) => ({ ...row }));
+    const previousPhase = batchPhase;
+    try {
+      for (const row of batchRows) {
+        if (row.status === 'unconfirmed' || row.status === 'sending') {
+          row.status = 'skipped';
+          row.error = 'Checked by you. This recipient will not be retried.';
+        }
+      }
+      batchPhase = remainingBatchRows().length ? 'paused' : 'complete';
+      saveBatch();
+      sessionStorage.removeItem(pendingKey);
+      locked = false;
+      batchStatus.textContent = 'The unconfirmed row was skipped permanently. Review any remaining recipients before sending.';
+      renderBatch();
+      loadAccount();
+    } catch {
+      batchRows = previousRows;
+      batchPhase = previousPhase;
+      locked = true;
+      batchStatus.textContent = 'Could not save your acknowledgment. Do not send again; check My Transactions.';
+      renderBatch();
+    }
+  });
+
+  batchNewButton.addEventListener('click', () => {
+    if (busy || locked || hasUnknownBatchRow()) return;
+    batchRows = [];
+    animatedBatchIds.clear();
+    batchNextRecipientAt = 0;
+    batchPhase = 'draft';
+    batchSnapshot = null;
+    batchSenderId = account?.id;
+    try { sessionStorage.removeItem(batchKey); } catch { batchStatus.textContent = 'Could not clear the saved batch.'; return; }
+    batchStatus.textContent = '';
+    resetRecipientEditor();
+    renderBatch();
+  });
+
   async function api(url, body, { signal, processing = false } = {}) {
+    if (Date.now() < apiCooldownUntil) throw cooldownError();
     const headers = { Accept: 'application/json' };
     const options = {
       method: body ? 'POST' : 'GET', credentials: 'include', cache: 'no-store',
@@ -405,7 +1741,6 @@
       data = await response.json().catch(() => null);
       const refreshed = response.headers.get('x-csrf-token');
       const hasChallenge = response.headers.get('rblx-challenge-id') || data?.ampRecourseActions?.length;
-      // A rejected CSRF request has no transfer effect. Refresh once, then stop on errors.
       if (body && response.status === 403 && refreshed && !hasChallenge) {
         csrfToken = refreshed;
         headers['X-CSRF-TOKEN'] = refreshed;
@@ -419,6 +1754,20 @@
     }
     if (!response.ok || response.headers.get('rblx-challenge-id') || data?.ampRecourseActions?.length || data?.failureReason || data?.success === false) {
       const error = new Error(describeError(response, data));
+      error.status = response.status;
+      error.hasChallenge = Boolean(response.headers.get('rblx-challenge-id') || data?.ampRecourseActions?.length);
+      if (response.status === 429) {
+        error.rateLimited = true;
+        error.retryAt = rememberApiCooldown(response);
+        const path = new URL(String(url)).pathname;
+        const requestName = path.includes('/process-transfer/') ? 'transfer submission'
+          : path.endsWith('/initiate-transfer') ? 'transfer preparation'
+          : path.endsWith('/authenticated') ? 'sender checks'
+          : path.endsWith('/user-transfer-limit') ? 'limit refreshes'
+          : path.startsWith('/transaction-records/') ? 'transfer history'
+          : path.endsWith('/user/currency') ? 'balance refreshes' : 'recipient lookups';
+        if (!error.hasChallenge) error.message = 'Roblox rate limited ' + requestName + '. Wait for the cooldown before resuming.';
+      }
       error.definitelyRejected = [400, 401, 403, 404, 422, 429].includes(response.status);
       throw error;
     }
@@ -427,12 +1776,16 @@
   }
 
   function updateAccountDisplay() {
-    const balanceValue = element('span', '', { class: 'money' });
+    const balanceValue = element('span', '', { class: 'money account-balance' });
     showRobux(balanceValue, balance);
+    if (balanceEstimated) {
+      balanceValue.append(element('small', 'est.'));
+      balanceValue.setAttribute('aria-label', balance + ' Robux, estimated');
+    }
     accountLabel.className = 'account-line';
     accountLabel.replaceChildren(element('span', 'From @' + account.name), balanceValue);
     amount.max = String(limits.perTransferLimit);
-    limitsLabel.textContent = '10–' + limits.perTransferLimit + ' Robux per transfer.';
+    limitsLabel.textContent = '10–' + new Intl.NumberFormat('en-US').format(limits.perTransferLimit) + ' Robux per transfer.';
     if (balance < 10) limitsLabel.textContent = 'Your balance is below the 10 Robux minimum.';
   }
 
@@ -442,34 +1795,94 @@
     } catch { /* Keep the local allowance adjustment in memory. */ }
   }
 
-  function displayAllowances() {
-    const seenIds = new Set(usageTransfers.map((transfer) => transfer.id));
-    acceptedTransfers = acceptedTransfers.filter((transfer) => !seenIds.has(transfer.id));
+  function canonicalTransferReference(value) {
+    // Roblox's RXT-prefixed request reference and its numeric-string history reference
+    // identify the same transfer. Never round these long identifiers through Number().
+    if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? String(value) : '';
+    if (typeof value !== 'string') return '';
+    const reference = value.trim();
+    const numeric = reference.match(/^(?:RXT-)?(\d+)$/i);
+    return numeric ? numeric[1].replace(/^0+(?=\d)/, '') : reference;
+  }
+
+  function reconcileUsageTransfers() {
+    const historyReferences = usageTransfers.map((transfer) =>
+      canonicalTransferReference(transfer.reference === undefined ? transfer.id : transfer.reference));
+    const seenLocal = new Set();
+    const locals = [];
+    for (const transfer of acceptedTransfers) {
+      const reference = canonicalTransferReference(transfer.id);
+      if (!reference || seenLocal.has(reference)) continue;
+      seenLocal.add(reference);
+      locals.push(transfer);
+    }
+    const matchedHistory = new Set();
+    const pending = [];
+    for (const transfer of locals) {
+      const reference = canonicalTransferReference(transfer.id);
+      const index = historyReferences.indexOf(reference);
+      if (index >= 0) matchedHistory.add(index);
+      else pending.push(transfer);
+    }
+    // Some history rows initially expose only an opaque row hash. In that case,
+    // require a unique recipient, gross amount and close timestamp match. A row
+    // already seen before this send, or a different known reference, cannot match.
+    const candidates = pending.map((local) => usageTransfers.reduce((indices, history, index) => {
+      if (matchedHistory.has(index) || historyReferences[index] ||
+          !Number.isSafeInteger(local.recipientId) || local.recipientId <= 0 ||
+          String(history.recipientId) !== String(local.recipientId) ||
+          history.grossAmount !== local.amount ||
+          !Number.isFinite(history.observedAt) || history.observedAt < local.createdMs ||
+          Math.abs(history.createdMs - local.createdMs) > 60000) return indices;
+      indices.push(index);
+      return indices;
+    }, []));
+    acceptedTransfers = pending.filter((local, localIndex) => {
+      const indices = candidates[localIndex];
+      if (indices.length !== 1) return true;
+      const index = indices[0];
+      if (candidates.some((other, otherIndex) => otherIndex !== localIndex && other.includes(index))) return true;
+      matchedHistory.add(index);
+      return false;
+    });
     saveAcceptedTransfers();
-    const transfers = [...usageTransfers, ...acceptedTransfers];
+    return [...usageTransfers, ...acceptedTransfers];
+  }
+
+  function displayAllowances() {
+    const transfers = reconcileUsageTransfers();
     const now = Date.now();
     for (const [card, rawCap, windowDays] of [
       [dailyAllowance, limits?.dailyLimit, 1],
       [monthlyAllowance, limits?.monthlyLimit, 30],
     ]) {
+      card.value.classList.remove('is-loading');
       const cap = Number(rawCap);
       if (rawCap == null || !Number.isSafeInteger(cap) || cap < 0) {
         card.value.textContent = 'Unavailable';
         card.cap.textContent = 'Account cap unavailable';
+        card.pct.textContent = '';
         card.progress.hidden = true;
+        card.track.hidden = true;
         continue;
       }
       card.cap.textContent = 'of ' + new Intl.NumberFormat('en-US').format(cap) + ' Robux allowance';
       card.progress.max = Math.max(1, cap);
       card.progress.hidden = !usageReady;
+      card.track.hidden = !usageReady;
       if (!usageReady) {
         card.value.textContent = 'Unavailable';
+        card.pct.textContent = '';
         continue;
       }
       const used = transfers.reduce((sum, transfer) =>
         transfer.createdMs > now - windowDays * 86400000 ? sum + transfer.amount : sum, 0);
       showRobux(card.value, Math.max(0, cap - used));
       card.progress.value = Math.min(cap, used);
+      const ratio = cap > 0 ? Math.min(1, Math.max(0, used / cap)) : 0;
+      card.pct.textContent = Math.round(ratio * 100) + '% used';
+      card.fill.dataset.level = ratio >= 0.92 ? 'high' : ratio >= 0.75 ? 'warn' : 'ok';
+      requestAnimationFrame(() => { card.fill.style.transform = 'scaleX(' + ratio + ')'; });
     }
   }
 
@@ -478,6 +1891,7 @@
     const seenRows = new Set();
     const seenCursors = new Set();
     const cutoff = Date.now() - 30 * 86400000;
+    const observedAt = Date.now();
     let cursor = '';
     do {
       if (seenCursors.has(cursor)) throw new Error('Roblox repeated a history page.');
@@ -494,15 +1908,25 @@
         const value = Number(row.currency?.amount);
         const createdMs = Date.parse(row.created);
         if (!Number.isFinite(value) || !Number.isFinite(createdMs)) continue;
-        if (row.idHash && seenRows.has(row.idHash)) continue;
-        if (row.idHash) seenRows.add(row.idHash);
         const isSent = details.transferRole === 'Sender' && value < 0;
         const isRefund = details.transferRole === 'SenderRefund' && value > 0;
         if (!isSent && !isRefund) continue;
-        const id = String(details.transferRequestId || row.idHash || row.created + ':' + Math.abs(value));
-        const transfer = grouped.get(id) || { id, amount: 0, createdMs };
+        const reference = canonicalTransferReference(details.transferRequestId);
+        const rowKey = row.idHash ? 'row:' + row.idHash
+          : [reference, row.created, value, details.transferRole, details.recipientTargetId || ''].join(':');
+        if (seenRows.has(rowKey)) continue;
+        seenRows.add(rowKey);
+        const id = reference || String(row.idHash || rowKey);
+        const transfer = grouped.get(id) || {
+          id, reference, amount: 0, grossAmount: 0,
+          recipientId: details.recipientTargetId, createdMs, observedAt,
+        };
         transfer.amount -= value;
-        if (isSent) transfer.createdMs = Math.min(transfer.createdMs, createdMs);
+        if (isSent) {
+          transfer.grossAmount += Math.abs(value);
+          transfer.createdMs = Math.min(transfer.createdMs, createdMs);
+          transfer.recipientId = details.recipientTargetId;
+        }
         grouped.set(id, transfer);
       }
       const oldest = Date.parse(page.data[page.data.length - 1]?.created);
@@ -520,10 +1944,11 @@
       return refreshUsage(force);
     }
     const owner = account;
+    const revision = statsRevision;
     const cacheKey = 'robux-transfer-usage:' + owner.id;
     let cached;
     try { cached = JSON.parse(sessionStorage.getItem(cacheKey)); } catch { /* Fetch current history. */ }
-    if (!force && cached?.fetchedAt > Date.now() - 120000 && Array.isArray(cached.transfers)) {
+    if (!force && cached?.version === usageCacheVersion && cached.fetchedAt > Date.now() - 120000 && Array.isArray(cached.transfers)) {
       usageTransfers = cached.transfers;
       usageReady = true;
       displayAllowances();
@@ -534,59 +1959,133 @@
     usageRequest = (async () => {
       try {
         const transfers = await fetchTransferHistory(owner.id);
-        if (account?.id !== owner.id || profileLookups.signal.aborted) return;
+        if (account !== owner || revision !== statsRevision || profileLookups.signal.aborted) return;
+        const firstSeen = new Map(usageTransfers.map((transfer) => [transfer.id, transfer.observedAt]));
+        for (const transfer of transfers) {
+          const previous = firstSeen.get(transfer.id);
+          if (Number.isFinite(previous)) transfer.observedAt = Math.min(transfer.observedAt, previous);
+        }
         usageTransfers = transfers;
         usageReady = true;
-        try { sessionStorage.setItem(cacheKey, JSON.stringify({ transfers, fetchedAt: Date.now() })); } catch { /* Cache is optional. */ }
+        try { sessionStorage.setItem(cacheKey, JSON.stringify({ version: usageCacheVersion, transfers, fetchedAt: Date.now() })); } catch { /* Cache is optional. */ }
         displayAllowances();
         allowanceNote.textContent = 'History estimate · last 24h / 30 days';
       } catch {
-        if (profileLookups.signal.aborted) return;
+        if (account !== owner || revision !== statsRevision || profileLookups.signal.aborted) return;
         displayAllowances();
         allowanceNote.textContent = usageReady ? 'Last history estimate · refresh unavailable' : 'Remaining allowance unavailable · try Refresh';
       } finally {
         usageRequest = null;
-        refreshAllowanceButton.disabled = busy;
+        setBusy(busy);
       }
     })();
-    refreshAllowanceButton.disabled = true;
+    setBusy(busy);
     return usageRequest;
   }
 
-  async function refreshAccountStats() {
-    if (!account) return;
+  function clearStatsRefreshTimers() {
+    for (const timer of statsRefreshTimers) clearTimeout(timer);
+    statsRefreshTimers.clear();
+  }
+
+  function refreshAfterSend() {
+    if (batchRunning) { batchStatsDirty = true; return; }
+    clearStatsRefreshTimers();
     const owner = account;
-    refreshAllowanceButton.disabled = true;
-    try {
-      const [currency, transferLimits] = await Promise.all([
-        api('https://economy.roblox.com/v1/user/currency'),
-        api(transferApi + '/user-transfer-limit'),
-      ]);
-      if (account !== owner || profileLookups.signal.aborted) return;
-      if (!Number.isSafeInteger(currency.robux) || !Number.isSafeInteger(transferLimits.perTransferLimit)) {
-        throw new Error('Account refresh unavailable');
-      }
-      balance = currency.robux;
-      limits = transferLimits;
-      updateAccountDisplay();
-      await refreshUsage(true);
-    } catch {
-      allowanceNote.textContent = 'Account refresh unavailable · try Refresh';
-    } finally {
-      refreshAllowanceButton.disabled = busy || Boolean(usageRequest);
+    const revision = ++statsRevision;
+    refreshAccountStats();
+    for (const delay of [1500, 5000]) {
+      const timer = setTimeout(() => {
+        statsRefreshTimers.delete(timer);
+        if (account === owner && statsRevision === revision && !profileLookups.signal.aborted) {
+          refreshAccountStats();
+        }
+      }, delay);
+      statsRefreshTimers.add(timer);
     }
   }
+
+  async function refreshAccountStats() {
+    if (!account || profileLookups.signal.aborted) return;
+    if (batchRunning || Date.now() < apiCooldownUntil) { batchStatsDirty = true; return; }
+    const owner = account;
+    if (statsRequest) {
+      const revision = statsRequestRevision;
+      await statsRequest;
+      if (account === owner && revision !== statsRevision && !profileLookups.signal.aborted) {
+        return refreshAccountStats();
+      }
+      return;
+    }
+    const revision = statsRevision;
+    statsRequestRevision = revision;
+    allowanceNote.textContent = 'Refreshing balance and limits…';
+    statsRequest = (async () => {
+      try {
+        const readOptions = { signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(15000)]) };
+        const [currencyResult, limitsResult] = await Promise.allSettled([
+          api('https://economy.roblox.com/v1/user/currency', undefined, readOptions),
+          api(transferApi + '/user-transfer-limit', undefined, readOptions),
+        ]);
+        if (account !== owner || revision !== statsRevision || profileLookups.signal.aborted) return;
+        const currency = currencyResult.status === 'fulfilled' ? currencyResult.value : null;
+        const transferLimits = limitsResult.status === 'fulfilled' ? limitsResult.value : null;
+        const currencyReady = Number.isSafeInteger(currency?.robux) && currency.robux >= 0;
+        const limitsReady = Number.isSafeInteger(transferLimits?.perTransferLimit) && transferLimits.perTransferLimit >= 0;
+        if (currencyReady) { balance = currency.robux; balanceEstimated = false; }
+        if (limitsReady) limits = transferLimits;
+        updateAccountDisplay();
+        accountStatus.textContent = currencyReady && limitsReady ? ''
+          : (!currencyReady && !limitsReady ? 'Balance and limits' : !currencyReady ? 'Balance' : 'Limits')
+            + ' could not refresh. Showing previous values.';
+        await refreshUsage(true);
+      } catch {
+        if (account === owner && revision === statsRevision && !profileLookups.signal.aborted) {
+          allowanceNote.textContent = 'Account refresh unavailable · try Refresh';
+        }
+      } finally {
+        statsRequest = null;
+        setBusy(busy);
+      }
+    })();
+    setBusy(busy);
+    return statsRequest;
+  }
   refreshAllowanceButton.addEventListener('click', () => { if (!busy) refreshAccountStats(); });
+
+  function triggerSuccessAnimation() {
+    successCheck.replaceChildren(svgIcon([
+      {
+        d: 'M5 13l4.5 4.5L19 7.5',
+        fill: 'none', stroke: 'currentColor', 'stroke-width': '2.8',
+        'stroke-linecap': 'round', 'stroke-linejoin': 'round', class: 'check-path',
+      },
+    ], ''));
+    for (const old of successHero.querySelectorAll('.burst-dot')) old.remove();
+    const colors = ['#22c55e', '#3b82f6', '#6366f1', '#f59e0b', '#38bdf8'];
+    for (let i = 0; i < 12; i++) {
+      const angle = (Math.PI * 2 * i) / 12 + (Math.random() * 0.25 - 0.125);
+      const dist = 42 + Math.random() * 26;
+      const dot = element('span', '', { class: 'burst-dot', 'aria-hidden': 'true' });
+      dot.style.background = colors[i % colors.length];
+      dot.style.setProperty('--dx', Math.round(Math.cos(angle) * dist) + 'px');
+      dot.style.setProperty('--dy', Math.round(Math.sin(angle) * dist) + 'px');
+      dot.addEventListener('animationend', () => dot.remove(), { once: true });
+      successHero.append(dot);
+    }
+  }
 
   function showSuccess(transfer) {
     const submittedAt = new Date();
     lastReceipt = { ...transfer, sender: account.name, submittedAt: submittedAt.toLocaleString() };
-    acceptedTransfers.push({ id: transfer.id, amount: transfer.amount, createdMs: submittedAt.getTime() });
+    acceptedTransfers.push({ id: transfer.id, recipientId: transfer.recipientId, amount: transfer.amount, createdMs: submittedAt.getTime() });
     displayAllowances();
     transferTitle.textContent = 'Transfer submitted';
     recipientSection.hidden = true;
     form.hidden = true;
     successPanel.hidden = false;
+    animatePanel(successPanel);
+    triggerSuccessAnimation();
     showRobux(successAmount, transfer.amount);
     const avatar = createAvatar(transfer.recipientId, transfer.username);
     successRecipient.replaceChildren(avatar, element('a', '@' + transfer.username, {
@@ -598,7 +2097,7 @@
     receiptReference.textContent = transfer.id;
     receiptStatus.textContent = '';
     newTransferButton.hidden = false;
-    refreshAccountStats();
+    refreshAfterSend();
   }
 
   copyReceiptButton.addEventListener('click', async () => {
@@ -613,11 +2112,15 @@
         'Reference: ' + lastReceipt.id,
       ].join('\n'));
       receiptStatus.textContent = 'Receipt copied.';
+      copyReceiptButton.textContent = 'Copied ✓';
+      setTimeout(() => { copyReceiptButton.textContent = 'Copy receipt'; }, 1800);
     } catch { receiptStatus.textContent = 'Clipboard unavailable. You can select the receipt text.'; }
   });
 
   async function loadAccount() {
     if (busy || locked) return;
+    clearStatsRefreshTimers();
+    statsRevision++;
     setBusy(true);
     account = null;
     limits = null;
@@ -636,11 +2139,25 @@
       account = user;
       limits = transferLimits;
       balance = currency.robux;
+      balanceEstimated = false;
       try {
         const recent = JSON.parse(sessionStorage.getItem('robux-transfer-recent:' + user.id));
         acceptedTransfers = (Array.isArray(recent) ? recent : []).filter((transfer) =>
           typeof transfer.id === 'string' && Number.isFinite(transfer.amount) && transfer.amount > 0 &&
           Number.isFinite(transfer.createdMs) && transfer.createdMs > Date.now() - 30 * 86400000);
+        // Older saved sends did not retain the recipient ID. Recover it only
+        // from this sender's saved batch and an exact canonical reference match.
+        let savedBatch;
+        try { savedBatch = JSON.parse(sessionStorage.getItem(batchKey)); } catch { /* Keep valid recent sends if the batch cache is damaged. */ }
+        if (savedBatch?.senderId === user.id && Array.isArray(savedBatch.rows)) {
+          const recipients = new Map(savedBatch.rows.filter((row) => row && typeof row.reference === 'string')
+            .map((row) => [canonicalTransferReference(row.reference), row.recipientId]));
+          acceptedTransfers = acceptedTransfers.map((transfer) => {
+            const recipientId = recipients.get(canonicalTransferReference(transfer.id));
+            return !Number.isSafeInteger(transfer.recipientId) && Number.isSafeInteger(recipientId) && recipientId > 0
+              ? { ...transfer, recipientId } : transfer;
+          });
+        }
       } catch { acceptedTransfers = []; }
       usageTransfers = [];
       usageReady = false;
@@ -651,8 +2168,11 @@
       accountLabel.textContent = 'Account details unavailable';
       accountStatus.textContent = error.message;
       reloadButton.hidden = false;
+      dailyAllowance.value.classList.remove('is-loading');
+      monthlyAllowance.value.classList.remove('is-loading');
     } finally {
       setBusy(false);
+      if (batchMode) renderBatch();
     }
   }
   reloadButton.addEventListener('click', loadAccount);
@@ -662,6 +2182,7 @@
     prepared = null;
     review.hidden = true;
     editFields.hidden = false;
+    animatePanel(editFields);
     prepareStatus.textContent = '';
     setBusy(false);
     amount.focus();
@@ -710,9 +2231,10 @@
     const avatars = [];
     const batch = displayedUsers.slice(renderedUserCount, renderedUserCount + 5);
     renderedUserCount += batch.length;
-    for (const user of batch) {
+    batch.forEach((user, index) => {
       const username = '@' + user.name;
       const result = element('button', '', { type: 'button', class: 'result' });
+      result.style.setProperty('--i', String(index));
       const avatar = createAvatar(user.id, user.name);
       const names = element('span', user.displayName || username, { class: 'result-names' });
       if (user.displayName) names.append(element('span', username, { class: 'username' }));
@@ -720,7 +2242,7 @@
       avatars.push(avatar);
       result.addEventListener('click', () => selectRecipient(String(user.id), user.name));
       searchResults.append(result);
-    }
+    });
     loadAvatars(avatars, resultSignal);
   }
 
@@ -749,8 +2271,10 @@
 
     const pending = (async () => {
       try {
-        const options = { credentials: 'omit',
-          signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(8000)]) };
+        const options = {
+          credentials: 'omit',
+          signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(8000)]),
+        };
         let url;
         if (kind === 'exact') {
           url = 'https://users.roblox.com/v1/usernames/users';
@@ -805,6 +2329,7 @@
     recipientLink.textContent = username ? '@' + username : 'Roblox user #' + userId;
     searchForm.hidden = true;
     selectedRecipient.hidden = false;
+    animatePanel(selectedRecipient);
     form.hidden = false;
     showAmountEditor();
 
@@ -928,6 +2453,7 @@
     selectedRecipient.hidden = true;
     form.hidden = true;
     searchForm.hidden = false;
+    animatePanel(searchForm);
     searchField.focus();
     searchField.select();
   });
@@ -946,6 +2472,13 @@
       prepareStatus.textContent = 'Choose a recipient other than your own account.';
       return;
     }
+    if (batchMode) {
+      setBusy(true);
+      try { await addBatchRecipient(value); }
+      catch (error) { prepareStatus.textContent = error.message; }
+      finally { setBusy(false); renderBatch(); }
+      return;
+    }
     setBusy(true);
     prepareStatus.textContent = 'Preparing transfer with Roblox…';
     try {
@@ -955,8 +2488,10 @@
       if (typeof transfer.transferRequestId !== 'string' || !transfer.transferRequestId) {
         throw new Error('Roblox did not provide a transfer request ID.');
       }
-      prepared = Object.freeze({ id: transfer.transferRequestId, senderId: account.id,
-        recipientId: target.id, username: target.name, amount: value });
+      prepared = Object.freeze({
+        id: transfer.transferRequestId, senderId: account.id,
+        recipientId: target.id, username: target.name, amount: value,
+      });
       recipientLink.textContent = '@' + target.name;
       reviewedRecipient.textContent = 'To @' + target.name + ' · User ID ' + target.id;
       showRobux(total, value);
@@ -964,6 +2499,7 @@
       transactionsLink.hidden = true;
       editFields.hidden = true;
       review.hidden = false;
+      animatePanel(review);
       sendButton.hidden = false;
     } catch (error) {
       prepared = null;
@@ -973,7 +2509,10 @@
     }
     if (prepared) sendButton.focus();
   });
-  amount.addEventListener('input', () => amount.setCustomValidity(''));
+  amount.addEventListener('input', () => {
+    amount.setCustomValidity('');
+    syncPresetHighlight();
+  });
   editButton.addEventListener('click', showAmountEditor);
   sendButton.addEventListener('click', async () => {
     if (!prepared || busy || locked) return;
@@ -983,7 +2522,6 @@
     try {
       const currentUser = await api(usersApi + '/authenticated');
       if (currentUser.id !== transfer.senderId) throw new Error('Your signed-in account changed. Reload the page.');
-      // Preserve an uncertain attempt across refreshes. Never retry a timed-out payment.
       sessionStorage.setItem(pendingKey, JSON.stringify(transfer));
       locked = true;
       status.textContent = 'Sending ' + transfer.amount + ' Robux to @' + transfer.username + '…';
@@ -1032,23 +2570,87 @@
     successPanel.hidden = true;
     transferTitle.textContent = 'Send Robux';
     recipientSection.hidden = false;
+    animatePanel(recipientSection);
     selectedRecipient.hidden = true;
     searchForm.hidden = false;
     form.hidden = true;
     amount.value = '';
+    syncPresetHighlight();
     searchField.value = '';
     clearSearch();
     loadAccount();
     searchField.focus();
   });
 
+  function restoreBatch(saved) {
+    const statuses = new Set(['waiting', 'preparing', 'sending', 'submitted', 'failed', 'unconfirmed', 'skipped']);
+    if (saved?.version !== 1 || !Number.isSafeInteger(saved.senderId) || saved.senderId <= 0 ||
+        !Array.isArray(saved.rows) || !saved.rows.length || saved.rows.length > 50) return false;
+    const ids = new Set();
+    for (const row of saved.rows) {
+      if (!Number.isSafeInteger(row.recipientId) || row.recipientId <= 0 || ids.has(row.recipientId) ||
+          !Number.isSafeInteger(row.amount) || row.amount < 10 || typeof row.username !== 'string' ||
+          !/^[a-z0-9_]{1,20}$/i.test(row.username) || !statuses.has(row.status) ||
+          (row.reference !== undefined && typeof row.reference !== 'string')) return false;
+      ids.add(row.recipientId);
+    }
+    batchSenderId = saved.senderId;
+    batchNextRecipientAt = Number.isFinite(saved.nextRecipientAt) ? saved.nextRecipientAt : 0;
+    batchRows = saved.rows.map((row) => ({
+      ...row,
+      status: row.status === 'sending' ? 'unconfirmed' : row.status === 'preparing' ? 'waiting' : row.status,
+    }));
+    batchPhase = saved.phase === 'draft' && batchRows.every((row) => row.status === 'waiting') ? 'draft'
+      : remainingBatchRows().length || hasUnknownBatchRow() ? 'paused' : 'complete';
+    batchMode = true;
+    batchSnapshot = null;
+    locked = hasUnknownBatchRow();
+    resetRecipientEditor();
+    renderBatch(true);
+    return true;
+  }
+
   document.body.append(host);
   dialog.showModal();
-  if (currentProfile) selectRecipient(currentProfile[1]);
-  else searchField.focus();
+  updateCooldownStatus();
   let pending;
   try { pending = JSON.parse(sessionStorage.getItem(pendingKey)); } catch { /* No saved attempt. */ }
-  if (pending?.id) {
+  let savedBatch;
+  try { savedBatch = JSON.parse(sessionStorage.getItem(batchKey)); } catch { /* No saved batch. */ }
+  const restoredBatch = (!pending?.id || pending.batch === true) && restoreBatch(savedBatch);
+  if (restoredBatch && pending?.id) {
+    const row = batchRows.find((entry) => entry.reference === pending.id);
+    if (row?.status === 'submitted') {
+      try { sessionStorage.removeItem(pendingKey); pending = null; } catch { /* Preserve the submitted row; never repeat it. */ }
+    } else if (row) {
+      row.status = 'unconfirmed';
+      row.error = 'Previous request is unconfirmed. Check My Transactions; this row will not be retried.';
+      locked = true;
+    }
+    renderBatch(true);
+  }
+  if (restoredBatch && (!pending?.id || batchRows.some((row) => row.reference === pending.id))) {
+    if (hasUnknownBatchRow()) {
+      accountLabel.textContent = 'Check the previous batch request first';
+      dailyAllowance.value.classList.remove('is-loading');
+      monthlyAllowance.value.classList.remove('is-loading');
+      dailyAllowance.value.textContent = 'Unavailable';
+      monthlyAllowance.value.textContent = 'Unavailable';
+      allowanceNote.textContent = 'Check My Transactions before continuing';
+      batchStatus.textContent = 'Batch paused. Check the unconfirmed row in My Transactions. Acknowledging it skips that row permanently.';
+      locked = true;
+      setBusy(false);
+      renderBatch(true);
+    } else {
+      loadAccount();
+    }
+  } else if (pending?.id) {
+    batchMode = false;
+    setBatchDrawerOpen(false, true);
+    modeSwitch.dataset.mode = 'single';
+    singleModeButton.setAttribute('aria-pressed', 'true');
+    batchModeButton.setAttribute('aria-pressed', 'false');
+    reviewButton.textContent = 'Review transfer';
     locked = true;
     recipientSection.hidden = true;
     form.hidden = false;
@@ -1061,11 +2663,15 @@
     transactionsLink.hidden = false;
     acknowledgedButton.hidden = false;
     accountLabel.textContent = 'Check the previous request first';
+    dailyAllowance.value.classList.remove('is-loading');
+    monthlyAllowance.value.classList.remove('is-loading');
     dailyAllowance.value.textContent = 'Unavailable';
     monthlyAllowance.value.textContent = 'Unavailable';
     allowanceNote.textContent = 'Check the previous request before refreshing';
     setBusy(false);
   } else {
+    if (currentProfile) selectRecipient(currentProfile[1]);
+    else searchField.focus();
     loadAccount();
   }
 })();
