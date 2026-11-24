@@ -1090,6 +1090,21 @@
     reviewActions, status, transactionsLink, acknowledgedButton, newTransferButton);
   form.append(editFields, review);
 
+  const parentApprovalPanel = element('section', '', { id: 'robux-parent-approval', hidden: '' });
+  const parentApprovalSummary = element('p', '', { id: 'robux-parent-summary' });
+  const parentApprovalStatus = element('p', '', { id: 'robux-parent-status', class: 'status', role: 'status' });
+  const askParentButton = element('button', 'Ask parent', { type: 'button', class: 'primary' });
+  const parentCheckedButton = element('button', 'Check status', { type: 'button' });
+  const parentDiagnosticButton = element('button', 'Copy check details', { type: 'button', hidden: '' });
+  const parentNewButton = element('button', 'New transfer', { type: 'button', hidden: '' });
+  const parentTransactionsLink = element('a', 'Open My Transactions ↗', {
+    href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer', class: 'fallback',
+  });
+  const parentApprovalActions = element('div', '', { class: 'actions' });
+  parentApprovalActions.append(askParentButton, parentCheckedButton, parentDiagnosticButton, parentNewButton);
+  parentApprovalPanel.append(element('h3', 'Parent approval'), parentApprovalSummary,
+    parentApprovalStatus, parentTransactionsLink, parentApprovalActions);
+
   const successPanel = element('section', '', { class: 'success', hidden: '' });
   const successHero = element('div', '', { class: 'success-hero' });
   const successCheck = element('div', '', { class: 'success-check', 'aria-hidden': 'true' });
@@ -1108,6 +1123,8 @@
   const receiptSender = receiptRow('From');
   const receiptTime = receiptRow('Time');
   const receiptReference = receiptRow('Reference');
+  const receiptTransferId = receiptRow('Transfer ID');
+  receiptTransferId.parentElement.hidden = true;
   const successActions = element('div', '', { class: 'actions' });
   const successTransactions = element('a', 'View transactions ↗', {
     href: robloxWebsite + '/transactions', target: '_blank', rel: 'noopener noreferrer',
@@ -1150,7 +1167,7 @@
     batchNotice, batchStatus, batchTransactionsLink, batchActions);
   batchPanelClip.append(batchPanelInner);
   batchPanel.append(batchPanelClip);
-  dialog.append(header, modeSwitchWrap, accountSection, recipientSection, form, successPanel, batchPanel);
+  dialog.append(header, modeSwitchWrap, accountSection, recipientSection, form, parentApprovalPanel, successPanel, batchPanel);
   shadow.append(dialog);
 
   let recipient;
@@ -1161,8 +1178,14 @@
   let resultSignal;
   let usageTransfers = [];
   let usageReady = false;
-  const usageCacheVersion = 2;
+  const usageCacheVersion = 3;
   let usageRequest;
+  let usageLastAttemptAt = -Infinity;
+  let usageLastOwnerId;
+  let usageRefreshTimer;
+  let usageRefreshAfterRequest = false;
+  const historyReadMinimumMs = 30000;
+  const historyPages = new Map();
   let statsRequest;
   let statsRequestRevision;
   let statsRevision = 0;
@@ -1174,6 +1197,16 @@
   let balance;
   let balanceEstimated = false;
   let prepared;
+  let parentApproval;
+  let parentStatusRequest;
+  let parentStatusRefreshWanted = false;
+  let parentStatusTimer;
+  let parentStatusPollStep = 0;
+  let parentStatusWatchUntil = 0;
+  let parentResolutionReady = false;
+  let parentStatusPaused = false;
+  let lastParentDiagnostic;
+  const parentStatusPollDelays = [5000, 10000, 20000, 30000, 60000];
   let busy = false;
   let locked = false;
   let batchMode = false;
@@ -1234,6 +1267,8 @@
     batchCancelRequested = true;
     clearSearch();
     clearStatsRefreshTimers();
+    clearTimeout(parentStatusTimer);
+    clearTimeout(usageRefreshTimer);
     clearTimeout(apiCooldownTimer);
     releaseBatchWait();
     profileLookups.abort();
@@ -1253,7 +1288,7 @@
     amount.disabled = value;
     for (const button of presets.children) button.disabled = value;
     newTransferButton.disabled = value;
-    const refreshing = Boolean(usageRequest) || Boolean(statsRequest);
+    const refreshing = Boolean(usageRequest) || Boolean(statsRequest) || Boolean(parentStatusRequest);
     refreshAllowanceButton.disabled = value || coolingDown || refreshing;
     refreshAllowanceButton.classList.toggle('spinning', refreshing);
     singleModeButton.disabled = value || locked;
@@ -1265,6 +1300,9 @@
     batchNewButton.disabled = value || locked;
     batchAcknowledgeButton.disabled = value;
     batchCancelButton.disabled = !batchRunning || batchCancelRequested;
+    askParentButton.disabled = value || coolingDown || !parentApproval || parentApproval.parentApproval !== 'required' || Boolean(parentStatusRequest);
+    parentCheckedButton.disabled = value || coolingDown || !parentApproval || Boolean(parentStatusRequest);
+    parentNewButton.disabled = value || !parentResolutionReady || Boolean(parentStatusRequest);
     reviewButton.classList.toggle('is-busy', value && !reviewButton.hidden && editFields && !editFields.hidden);
     sendButton.classList.toggle('is-busy', value && !sendButton.hidden && !review.hidden);
     batchSendButton.classList.toggle('is-busy', value && batchRunning);
@@ -1287,6 +1325,419 @@
   function hasUnknownBatchRow() {
     return batchRows.some((row) => row.status === 'unconfirmed' || row.status === 'sending');
   }
+
+  function hasParentApprovalRow() {
+    return batchRows.some((row) => ['parent_required', 'parent_requesting', 'parent_pending', 'parent_unknown'].includes(row.status));
+  }
+
+  function terminalParentStatus(status) {
+    return ['Completed', 'Cancelled', 'Failed', 'Submitted', 'Refunded'].includes(status);
+  }
+
+  function renderParentApproval(message) {
+    parentApprovalPanel.hidden = !parentApproval;
+    if (!parentApproval) return;
+    parentApprovalSummary.textContent = '@' + parentApproval.username + ' · '
+      + new Intl.NumberFormat('en-US').format(parentApproval.amount) + ' Robux · ' + parentApproval.id;
+    const state = parentApproval.parentApproval;
+    const transferStatus = parentApproval.transferStatus;
+    askParentButton.hidden = state !== 'required' || terminalParentStatus(transferStatus);
+    const messages = {
+      required: 'Roblox requires your parent to approve this transfer. Select Ask parent to send the request.',
+      requesting: 'Sending the approval request to your linked parent…',
+      requested: 'Request sent. Waiting for your parent to review it in Roblox. Status checks update this panel automatically.',
+      unknown: 'The parent request result is unconfirmed. Checking the existing transfer will not send another request.',
+    };
+    const transferMessages = {
+      Initiated: 'Roblox reports this transfer is initiated. Parent approval or another required step may still be pending.',
+      Pending: 'Transfer pending in Roblox. Approval or recipient action may still be required; this is not a confirmed completed transfer.',
+      Completed: 'Roblox confirmed this transfer is completed.',
+      Cancelled: 'Roblox cancelled this transfer. It will not be retried automatically.',
+      Failed: 'Roblox reports this transfer failed. It will not be retried automatically.',
+      Submitted: 'Sent confirmed in My Transactions. Recipient acceptance has not been verified.',
+      Refunded: 'My Transactions shows this transfer was fully refunded. This row will not be retried.',
+    };
+    parentApprovalStatus.textContent = message || transferMessages[transferStatus] || messages[state] || messages.unknown;
+    parentCheckedButton.hidden = state === 'requesting' || parentResolutionReady;
+    parentNewButton.hidden = !parentResolutionReady || parentApproval.batch || ['Completed', 'Submitted'].includes(transferStatus);
+    parentDiagnosticButton.hidden = !lastParentDiagnostic || terminalParentStatus(transferStatus);
+    setBusy(busy);
+  }
+
+  function saveParentApproval() {
+    if (!parentApproval) return;
+    if (parentApproval.batch) {
+      const row = batchRows.find((entry) => entry.reference === parentApproval.id);
+      if (!row) throw new Error('The saved batch no longer contains this transfer.');
+      const states = { required: 'parent_required', requesting: 'parent_requesting', requested: 'parent_pending', unknown: 'parent_unknown' };
+      const outcomes = { Completed: 'submitted', Submitted: 'submitted', Cancelled: 'parent_cancelled', Failed: 'parent_failed', Refunded: 'parent_refunded' };
+      row.status = outcomes[parentApproval.transferStatus] || states[parentApproval.parentApproval] || 'parent_unknown';
+      row.parentTransferStatus = parentApproval.transferStatus;
+      row.parentConfirmationSource = parentApproval.confirmationSource;
+      row.transferId = parentApproval.transferId;
+      row.error = parentApproval.transferStatus === 'Pending' ? 'Transfer pending in Roblox.'
+        : parentApproval.transferStatus === 'Completed' ? 'Completed in Roblox.'
+        : parentApproval.transferStatus === 'Cancelled' ? 'Cancelled in Roblox. This row will not be retried.'
+        : parentApproval.transferStatus === 'Failed' ? 'Failed in Roblox. This row will not be retried.'
+        : parentApproval.transferStatus === 'Submitted' ? 'Sent confirmed in My Transactions. Recipient acceptance unverified.'
+        : parentApproval.transferStatus === 'Refunded' ? 'Fully refunded in My Transactions. This row will not be retried.'
+        : parentApproval.parentApproval === 'requested' ? 'Waiting for parent review.' : 'Parent approval required.';
+      batchPhase = remainingBatchRows().length || hasUnknownBatchRow() || hasParentApprovalRow() ? 'paused' : 'complete';
+      saveBatch();
+    }
+    sessionStorage.setItem(pendingKey, JSON.stringify(parentApproval));
+  }
+
+  function beginParentApproval(transfer, batch = false) {
+    clearTimeout(parentStatusTimer);
+    lastParentDiagnostic = null;
+    parentResolutionReady = false;
+    parentApproval = { ...transfer, batch, parentApproval: 'required' };
+    locked = true;
+    prepared = null;
+    sendButton.hidden = true;
+    acknowledgedButton.hidden = true;
+    try {
+      saveParentApproval();
+      renderParentApproval();
+    } catch {
+      parentApproval.parentApproval = 'unknown';
+      renderParentApproval('Could not save the approval state. Check this transfer in Roblox before continuing.');
+    }
+  }
+
+  function readParentApproval(value) {
+    if (!value || !['required', 'requesting', 'requested', 'unknown'].includes(value.parentApproval) ||
+        typeof value.id !== 'string' || !value.id.trim() || value.id.length > 200 ||
+        typeof value.username !== 'string' || !/^[a-z0-9_]{1,20}$/i.test(value.username) ||
+        !Number.isSafeInteger(value.senderId) || value.senderId <= 0 ||
+        !Number.isSafeInteger(value.recipientId) || value.recipientId <= 0 ||
+        !Number.isSafeInteger(value.amount) || value.amount < 10) return null;
+    const statuses = ['Initiated', 'Pending', 'Completed', 'Cancelled', 'Failed'];
+    if (value.confirmationSource === 'history') statuses.push('Submitted', 'Refunded');
+    const transferStatus = statuses.includes(value.transferStatus)
+      ? value.transferStatus : undefined;
+    return { ...value, batch: value.batch === true, transferStatus, transferId: normalizeTransferId(value.transferId) || undefined,
+      parentApproval: value.parentApproval === 'requesting' ? 'unknown' : value.parentApproval };
+  }
+
+  function isCurrentParentTransfer(transfer) {
+    return parentApproval === transfer && !profileLookups.signal.aborted;
+  }
+
+  function hydrateParentAccount(sender) {
+    if (account?.id === sender.id) return false;
+    clearStatsRefreshTimers();
+    statsRevision++;
+    account = sender;
+    limits = null;
+    balance = undefined;
+    usageTransfers = [];
+    usageReady = false;
+    try {
+      const recent = JSON.parse(sessionStorage.getItem('robux-transfer-recent:' + sender.id));
+      acceptedTransfers = (Array.isArray(recent) ? recent : []).filter((transfer) =>
+        typeof transfer.id === 'string' && Number.isFinite(transfer.amount) && transfer.amount > 0 &&
+        Number.isFinite(transfer.createdMs) && transfer.createdMs > Date.now() - 30 * 86400000);
+    } catch { acceptedTransfers = []; }
+    accountLabel.textContent = 'From @' + sender.name;
+    return true;
+  }
+
+  function normalizeTransferId(value) {
+    const id = canonicalTransferReference(value);
+    return id.length <= 200 && /^[1-9]\d*$/.test(id) ? id : '';
+  }
+
+  function readVerifiedParentTransfer(data, expected, lookupRequestId) {
+    const transfer = data?.transfer;
+    const transferId = normalizeTransferId(transfer?.transferId);
+    const mismatches = [];
+    // The GET is addressed by its RXT request reference. The returned transferId
+    // belongs to a different identifier namespace and may change while processing.
+    if (typeof lookupRequestId !== 'string' || lookupRequestId !== expected.id) mismatches.push('lookup request');
+    if (!transferId) mismatches.push('transfer ID');
+    if (String(transfer?.sender?.targetId) !== String(expected.senderId)) mismatches.push('sender');
+    if (String(transfer?.recipient?.targetId) !== String(expected.recipientId)) mismatches.push('recipient');
+    if (transfer?.transferAmount !== expected.amount) mismatches.push('amount');
+    const scalar = (value) => ['string', 'number', 'boolean'].includes(typeof value) ? value : null;
+    lastParentDiagnostic = {
+      expected: { requestReference: expected.id, senderId: expected.senderId, recipientId: expected.recipientId, amount: expected.amount },
+      lookupRequestId: scalar(lookupRequestId),
+      observed: { transferId: scalar(transfer?.transferId), senderId: scalar(transfer?.sender?.targetId),
+        recipientId: scalar(transfer?.recipient?.targetId), amount: scalar(transfer?.transferAmount), status: scalar(transfer?.status) },
+      responseKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 20) : [],
+      transferKeys: transfer && typeof transfer === 'object' ? Object.keys(transfer).slice(0, 20) : [],
+      mismatches,
+    };
+    if (mismatches.length) {
+      throw new Error('Status response did not match: ' + mismatches.join(', ') + '.');
+    }
+    const names = ['Initiated', 'Pending', 'Cancelled', 'Failed', 'Completed'];
+    const status = Number.isInteger(transfer.status) ? names[transfer.status]
+      : typeof transfer.status === 'string' && names.includes(transfer.status) ? transfer.status : undefined;
+    if (!status) throw new Error('Roblox returned an unrecognized transfer status.');
+    lastParentDiagnostic = null;
+    return { ...transfer, status, transferId };
+  }
+
+  function verifyOutgoingHistory(page, expected) {
+    if (!Array.isArray(page?.data)) throw new Error('Roblox did not return transfer history.');
+    const reference = canonicalTransferReference(expected.id);
+    if (!reference) return null;
+    const seen = new Map();
+    let sent = 0;
+    let sentRows = 0;
+    let refunded = 0;
+    for (const row of page.data) {
+      const details = row?.details || {};
+      if (canonicalTransferReference(details.transferRequestId) !== reference) continue;
+      if (String(details.senderTargetId) !== String(expected.senderId)) return null;
+      const value = Number(row.currency?.amount);
+      if (!Number.isSafeInteger(value) || !Number.isFinite(Date.parse(row.created))) return null;
+      const key = row.idHash ? String(row.idHash)
+        : [row.created, value, details.transferRole, details.recipientTargetId || ''].join(':');
+      const fingerprint = [row.created, value, details.senderTargetId, details.recipientTargetId || '', details.transferRole].join(':');
+      if (seen.has(key)) {
+        if (seen.get(key) !== fingerprint) return null;
+        continue;
+      }
+      seen.set(key, fingerprint);
+      if (details.transferRole === 'Sender' && value < 0 &&
+          String(details.recipientTargetId) === String(expected.recipientId)) {
+        if (++sentRows !== 1 || value !== -expected.amount) return null;
+        sent -= value;
+      }
+      else if (details.transferRole === 'SenderRefund' && value > 0 &&
+          (details.recipientTargetId == null || String(details.recipientTargetId) === String(expected.recipientId))) refunded += value;
+      else return null;
+    }
+    if (sent !== expected.amount) return null;
+    if (refunded === 0) return { status: 'Submitted', confirmationSource: 'history' };
+    if (refunded === sent) return { status: 'Refunded', confirmationSource: 'history' };
+    return null;
+  }
+
+
+  function finishParentTransfer(transfer) {
+    clearTimeout(parentStatusTimer);
+    // Persist the terminal row before removing its pending marker. A crash must never requeue it.
+    saveParentApproval();
+    if (transfer.batch || ['Completed', 'Submitted'].includes(transfer.transferStatus)) {
+      sessionStorage.removeItem(pendingKey);
+      parentApproval = null;
+      parentApprovalPanel.hidden = true;
+      locked = hasUnknownBatchRow() || hasParentApprovalRow();
+      if (transfer.batch) {
+        batchSnapshot = null;
+        batchStatus.textContent = transfer.transferStatus === 'Submitted'
+          ? 'Sent confirmed in My Transactions. Review any remaining recipients before continuing.'
+          : transfer.transferStatus === 'Completed'
+          ? 'Roblox confirmed this transfer is completed. Review any remaining recipients before continuing.'
+          : 'Roblox reports this transfer ' + transfer.transferStatus.toLowerCase() + '. This row will not be retried. Review any remaining recipients before continuing.';
+        renderBatch();
+      } else {
+        const completed = transfer.transferStatus === 'Completed';
+        showSuccess(transfer, { recordUsage: false, refresh: false, confirmed: completed });
+        transferTitle.textContent = completed ? 'Transfer completed' : 'Transfer sent';
+        if (!completed) {
+          lastReceipt.verifiedSent = true;
+          receiptTime.parentElement.querySelector('dt').textContent = 'Verified';
+        }
+        receiptStatus.textContent = completed ? 'Roblox confirmed this transfer is completed.'
+          : 'Sent confirmed in My Transactions. Recipient acceptance has not been verified.';
+      }
+      if (['Completed', 'Submitted', 'Refunded'].includes(transfer.transferStatus)) refreshAfterSend();
+    } else {
+      parentResolutionReady = true;
+      renderParentApproval();
+    }
+  }
+
+  function scheduleParentStatusCheck() {
+    clearTimeout(parentStatusTimer);
+    if (!parentApproval || parentStatusPaused || terminalParentStatus(parentApproval.transferStatus) ||
+        !['requested', 'unknown'].includes(parentApproval.parentApproval) || profileLookups.signal.aborted) return;
+    if (Date.now() >= parentStatusWatchUntil) {
+      renderParentApproval(parentApprovalStatus.textContent + ' Automatic checks paused. Select Check status to check again.');
+      return;
+    }
+    const delay = Math.max(parentStatusPollDelays[Math.min(parentStatusPollStep++, parentStatusPollDelays.length - 1)],
+      apiCooldownUntil - Date.now());
+    if (Date.now() + delay > parentStatusWatchUntil) return;
+    parentStatusTimer = setTimeout(() => {
+      if (document.hidden) { scheduleParentStatusCheck(); return; }
+      checkParentTransfer();
+    }, delay);
+  }
+
+  async function checkParentTransfer({ manual = false } = {}) {
+    if (!parentApproval || profileLookups.signal.aborted) return;
+    if (manual) {
+      parentStatusPaused = false;
+      parentStatusWatchUntil = Date.now() + 10 * 60000;
+      parentStatusPollStep = 0;
+      parentStatusRefreshWanted = true;
+    }
+    if (parentStatusRequest) return parentStatusRequest;
+    clearTimeout(parentStatusTimer);
+    if (Date.now() < apiCooldownUntil) { updateCooldownStatus(); scheduleParentStatusCheck(); return; }
+    const transfer = parentApproval;
+    const readOptions = { signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(15000)]) };
+    parentStatusRequest = (async () => {
+      let refreshStats = false;
+      let senderVerified = false;
+      let resolved = false;
+      try {
+        const sender = await api(usersApi + '/authenticated', undefined, readOptions);
+        if (!isCurrentParentTransfer(transfer)) return;
+        if (sender.id !== transfer.senderId || !sender.name) {
+          parentStatusPaused = true;
+          throw new Error('Your signed-in account changed. Reload the correct sender account before checking this transfer.');
+        }
+        senderVerified = true;
+        refreshStats = hydrateParentAccount(sender);
+        let current;
+        let statusError;
+        try {
+          const lookupRequestId = transfer.id;
+          const data = await api(transferApi + '/transfer/' + encodeURIComponent(lookupRequestId), undefined,
+            { ...readOptions, preserveTransferId: true });
+          if (!isCurrentParentTransfer(transfer)) return;
+          current = readVerifiedParentTransfer(data, transfer, lookupRequestId);
+        } catch (error) {
+          if (error.status === 401 || error.status === 403 || error.status === 429 || error.hasChallenge) throw error;
+          statusError = error;
+        }
+        if (!isCurrentParentTransfer(transfer)) return;
+        if (!current || !terminalParentStatus(current.status)) {
+          const page = await fetchHistoryPage(transfer.senderId, '');
+          if (!isCurrentParentTransfer(transfer)) return;
+          const recorded = verifyOutgoingHistory(page, transfer);
+          if (recorded) current = recorded;
+          else if (!current) {
+            throw new Error((statusError?.message || 'Transfer status is unavailable.')
+              + ' No exact sent transaction was found in the latest 100 records. Recent history is checked at most once every 30 seconds. '
+              + (lastParentDiagnostic ? 'Use Copy check details to inspect the mismatch.' : 'Check My Transactions.'));
+          }
+        }
+        const changed = transfer.transferStatus !== current.status;
+        transfer.transferStatus = current.status;
+        if (current.transferId) transfer.transferId = current.transferId;
+        transfer.confirmationSource = current.confirmationSource || 'status';
+        refreshStats = refreshStats || changed;
+        saveParentApproval();
+        if (terminalParentStatus(current.status)) {
+          finishParentTransfer(transfer);
+          resolved = true;
+        } else {
+          renderParentApproval();
+          if (transfer.batch) {
+            batchStatus.textContent = 'Batch paused. Waiting for a verified transfer result.';
+            renderBatch();
+          }
+        }
+      } catch (error) {
+        if (!isCurrentParentTransfer(transfer)) return;
+        if (error.status === 401 || error.status === 403 || error.hasChallenge) parentStatusPaused = true;
+        if (parentStatusPaused) {
+          clearTimeout(usageRefreshTimer);
+          usageRefreshAfterRequest = false;
+          clearStatsRefreshTimers();
+          statsRevision++;
+        }
+        renderParentApproval(error.message + ' No transfer or parent request was sent by this check.'
+          + (parentStatusPaused ? ' Automatic checks paused; select Check status after completing the required step in Roblox.' : ''));
+      } finally {
+        if (!profileLookups.signal.aborted && !parentStatusPaused && senderVerified && account?.id === transfer.senderId &&
+            (isCurrentParentTransfer(transfer) || resolved) && (refreshStats || parentStatusRefreshWanted)) {
+          await refreshAccountStats();
+        }
+        parentStatusRefreshWanted = false;
+        parentStatusRequest = null;
+        setBusy(busy);
+        if (isCurrentParentTransfer(transfer)) scheduleParentStatusCheck();
+      }
+    })();
+    setBusy(busy);
+    return parentStatusRequest;
+  }
+
+  function startParentStatusWatch() {
+    clearTimeout(parentStatusTimer);
+    parentStatusPaused = false;
+    parentStatusWatchUntil = Date.now() + 10 * 60000;
+    parentStatusPollStep = 0;
+    if (!document.hidden) checkParentTransfer();
+    else scheduleParentStatusCheck();
+  }
+
+  askParentButton.addEventListener('click', async () => {
+    if (busy || parentStatusRequest || !parentApproval || parentApproval.parentApproval !== 'required' || terminalParentStatus(parentApproval.transferStatus)) return;
+    if (Date.now() < apiCooldownUntil) { updateCooldownStatus(); return; }
+    const transfer = parentApproval;
+    let requestStarted = false;
+    setBusy(true);
+    try {
+      const sender = await api(usersApi + '/authenticated');
+      if (sender.id !== transfer.senderId) throw new Error('Your signed-in account changed. Reload the page before requesting approval.');
+      const transferId = transfer.id.replace(/^RXT-/, '');
+      if (!transferId) throw new Error('Roblox did not provide a valid transfer reference.');
+      transfer.parentApproval = 'requesting';
+      saveParentApproval();
+      renderParentApproval();
+      requestStarted = true;
+      await api('https://apis.roblox.com/child-requests-api/v1/send-request-to-all-parents', {
+        requestType: 'SendTransfer',
+        requestDetails: { transferType: 'Robux', transferId, robuxTransferAmount: transfer.amount },
+      }, { allowEmpty: true });
+      transfer.parentApproval = 'requested';
+      saveParentApproval();
+      renderParentApproval();
+    } catch (error) {
+      transfer.parentApproval = !requestStarted || error.definitelyRejected ? 'required' : 'unknown';
+      try { saveParentApproval(); } catch { transfer.parentApproval = 'unknown'; }
+      renderParentApproval(transfer.parentApproval === 'unknown'
+        ? 'The parent request result is unconfirmed. Check Roblox before continuing; do not send another request.'
+        : error.message);
+    } finally {
+      if (transfer.batch) renderBatch();
+      setBusy(false);
+      if (['requested', 'unknown'].includes(transfer.parentApproval)) startParentStatusWatch();
+    }
+  });
+
+  parentCheckedButton.addEventListener('click', () => {
+    if (!busy) return checkParentTransfer({ manual: true });
+  });
+
+  parentDiagnosticButton.addEventListener('click', async () => {
+    if (!lastParentDiagnostic) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(lastParentDiagnostic, null, 2));
+      parentDiagnosticButton.textContent = 'Details copied';
+      setTimeout(() => { parentDiagnosticButton.textContent = 'Copy check details'; }, 1800);
+    } catch { renderParentApproval('Could not copy the check details. Clipboard access is unavailable.'); }
+  });
+
+  parentNewButton.addEventListener('click', () => {
+    if (busy || !parentApproval || !parentResolutionReady || parentApproval.batch) return;
+    try {
+      sessionStorage.removeItem(pendingKey);
+      clearTimeout(parentStatusTimer);
+      parentApproval = null;
+      parentResolutionReady = false;
+      parentApprovalPanel.hidden = true;
+      locked = false;
+      recipientSection.hidden = false;
+      resetRecipientEditor();
+      transferTitle.textContent = 'Send Robux';
+      setBusy(false);
+      searchField.focus();
+    } catch {
+      renderParentApproval('Could not clear the saved result. Reopen this popup before starting another transfer.');
+    }
+  });
 
   function saveBatch() {
     sessionStorage.setItem(batchKey, JSON.stringify({
@@ -1390,13 +1841,20 @@
     }
     const counts = {};
     for (const row of batchRows) counts[row.status] = (counts[row.status] || 0) + 1;
+    const completedCount = batchRows.filter((row) => row.status === 'submitted' && row.parentTransferStatus === 'Completed').length;
+    const allCompleted = batchRows.length > 0 && completedCount === batchRows.length;
     const remaining = remainingBatchRows();
     batchSummary.textContent = batchRows.length ? batchRows.length + ' recipients · '
-      + (counts.submitted || 0) + ' submitted · ' + (counts.failed || 0) + ' failed · '
+      + ((counts.submitted || 0) - completedCount) + ' submitted · '
+      + (completedCount ? completedCount + ' completed · ' : '')
+      + ((counts.failed || 0) + (counts.parent_failed || 0)) + ' failed · '
       + (counts.unconfirmed || 0) + ' unconfirmed · ' + remaining.length + ' remaining'
       + (counts.skipped ? ' · ' + counts.skipped + ' skipped' : '')
+      + (counts.parent_refunded ? ' · ' + counts.parent_refunded + ' refunded' : '')
+      + (counts.parent_cancelled ? ' · ' + counts.parent_cancelled + ' cancelled' : '')
+      + (hasParentApprovalRow() ? ' · transfer confirmation needed' : '')
       : 'Add up to 50 recipients using the search above.';
-    batchTotalLabel.textContent = batchPhase === 'complete' ? 'Total submitted' : 'Total remaining';
+    batchTotalLabel.textContent = batchPhase === 'complete' ? allCompleted ? 'Total completed' : 'Total submitted' : 'Total remaining';
     const totalRows = batchPhase === 'complete' ? batchRows.filter((row) => row.status === 'submitted') : remaining;
     showRobux(batchTotal, totalRows.reduce((sum, row) => sum + row.amount, 0));
     batchList.replaceChildren();
@@ -1404,6 +1862,10 @@
     const labels = {
       waiting: 'Waiting', preparing: 'Preparing', sending: 'Sending', submitted: 'Submitted',
       failed: 'Failed', unconfirmed: 'Unconfirmed — check transactions', skipped: 'Skipped',
+      parent_required: 'Parent approval required', parent_requesting: 'Requesting parent approval',
+      parent_pending: 'Awaiting transfer confirmation', parent_unknown: 'Parent request unconfirmed',
+      parent_checked: 'Checked — not retried', parent_cancelled: 'Cancelled — not retried', parent_failed: 'Failed — not retried',
+      parent_refunded: 'Refunded — not retried',
     };
     for (const row of batchRows) {
       const isNew = !animatedBatchIds.has(row.recipientId);
@@ -1421,10 +1883,13 @@
         target: '_blank', rel: 'noopener noreferrer',
       });
       const meta = element('p');
-      meta.append(element('span', labels[row.status] || row.status, { class: 'status-pill', 'data-status': row.status }));
+      const label = row.status === 'submitted' && row.parentTransferStatus === 'Completed' ? 'Completed'
+        : row.status === 'parent_pending' && row.parentTransferStatus === 'Pending' ? 'Transfer pending in Roblox' : labels[row.status] || row.status;
+      meta.append(element('span', label, { class: 'status-pill', 'data-status': row.status }));
       if (row.reference || row.error) {
         meta.append(document.createTextNode((row.reference ? row.reference : '') + (row.error ? (row.reference ? ' · ' : '') + row.error : '')));
       }
+      if (row.transferId) meta.append(document.createTextNode(' · Transfer ID: ' + row.transferId));
       details.append(link, meta);
       const money = element('span', '', { class: 'money' });
       showRobux(money, row.amount);
@@ -1450,12 +1915,12 @@
     batchEditButton.hidden = batchPhase !== 'review';
     batchSendButton.hidden = batchPhase !== 'review';
     batchCancelButton.hidden = !batchRunning;
-    batchResumeButton.hidden = batchPhase !== 'paused' || !remaining.length || hasUnknownBatchRow();
+    batchResumeButton.hidden = batchPhase !== 'paused' || !remaining.length || hasUnknownBatchRow() || hasParentApprovalRow();
     batchAcknowledgeButton.hidden = !hasUnknownBatchRow();
     batchNewButton.hidden = !batchRows.length || batchPhase === 'review' || batchRunning;
-    batchTransactionsLink.hidden = !batchRows.some((row) => row.reference);
+    batchTransactionsLink.hidden = Boolean(parentApproval) || !batchRows.some((row) => row.reference);
     transferTitle.textContent = batchRunning ? 'Sending batch' : batchPhase === 'complete'
-      ? batchRows.every((row) => row.status === 'submitted') ? 'Batch submitted' : 'Batch finished' : 'Batch transfer';
+      ? allCompleted ? 'Batch completed' : batchRows.every((row) => row.status === 'submitted') ? 'Batch submitted' : 'Batch finished' : 'Batch transfer';
     setBatchDrawerOpen(true, instant);
     setBusy(busy);
   }
@@ -1649,6 +2114,11 @@
           batchStatus.textContent = 'Submitted ' + transfer.amount + ' Robux to @' + transfer.username + '.';
           renderBatch();
         } catch (error) {
+          if (error.parentConsentRequired && !accepted) {
+            beginParentApproval({ ...transfer, id: row.reference, senderId: batchSenderId }, true);
+            batchStatus.textContent = 'Batch paused. Ask your parent to review this transfer before continuing.';
+            break;
+          }
           const unknown = accepted || (processing && !error.definitelyRejected);
           row.status = unknown ? 'unconfirmed' : 'failed';
           row.error = unknown ? 'Check My Transactions before continuing. This row will never be retried.' : error.message;
@@ -1662,7 +2132,7 @@
           break;
         }
       }
-      batchPhase = remainingBatchRows().length || hasUnknownBatchRow() ? 'paused' : 'complete';
+      batchPhase = remainingBatchRows().length || hasUnknownBatchRow() || hasParentApprovalRow() ? 'paused' : 'complete';
       if (batchPhase === 'complete') batchStatus.textContent = 'Batch finished. Each submitted transfer has its own reference.';
       else if (batchCancelRequested) batchStatus.textContent = 'Batch stopped. Review remaining recipients before sending again.';
       saveBatch();
@@ -1674,7 +2144,7 @@
       batchRunning = false;
       releaseBatchWait();
       batchSnapshot = null;
-      locked = hasUnknownBatchRow();
+      locked = hasUnknownBatchRow() || hasParentApprovalRow();
       setBusy(false);
       renderBatch();
       refreshBatchStatsWhenReady();
@@ -1722,7 +2192,7 @@
     renderBatch();
   });
 
-  async function api(url, body, { signal, processing = false } = {}) {
+  async function api(url, body, { signal, processing = false, allowEmpty = false, preserveTransferId = false } = {}) {
     if (Date.now() < apiCooldownUntil) throw cooldownError();
     const headers = { Accept: 'application/json' };
     const options = {
@@ -1734,18 +2204,26 @@
       if (csrfToken) headers['X-CSRF-TOKEN'] = csrfToken;
       options.body = JSON.stringify(body);
     }
+    const readResponse = async (response) => {
+      if (!preserveTransferId) return response.json().catch(() => null);
+      // Status responses may encode the 19-digit transfer reference as a JSON number.
+      // Preserve that token before JSON parsing can round it through Number.
+      const text = await response.text();
+      try { return JSON.parse(text.replace(/("(?:transferId|transferRequestId)"\s*:\s*)(\d+)(?=\s*[,}])/g, '$1"$2"')); }
+      catch { return null; }
+    };
     let response;
     let data;
     try {
       response = await fetch(url, options);
-      data = await response.json().catch(() => null);
+      data = await readResponse(response);
       const refreshed = response.headers.get('x-csrf-token');
       const hasChallenge = response.headers.get('rblx-challenge-id') || data?.ampRecourseActions?.length;
       if (body && response.status === 403 && refreshed && !hasChallenge) {
         csrfToken = refreshed;
         headers['X-CSRF-TOKEN'] = refreshed;
         response = await fetch(url, options);
-        data = await response.json().catch(() => null);
+        data = await readResponse(response);
       }
     } catch {
       throw new Error(processing
@@ -1756,6 +2234,10 @@
       const error = new Error(describeError(response, data));
       error.status = response.status;
       error.hasChallenge = Boolean(response.headers.get('rblx-challenge-id') || data?.ampRecourseActions?.length);
+      const recourses = Array.isArray(data?.ampRecourseActions) ? data.ampRecourseActions : [];
+      error.parentConsentRequired = processing && String(url).includes('/process-transfer/')
+        && !response.headers.get('rblx-challenge-id') && recourses.length > 0
+        && recourses.every((recourse) => recourse === 'ParentConsentRecourse');
       if (response.status === 429) {
         error.rateLimited = true;
         error.retryAt = rememberApiCooldown(response);
@@ -1764,28 +2246,37 @@
           : path.endsWith('/initiate-transfer') ? 'transfer preparation'
           : path.endsWith('/authenticated') ? 'sender checks'
           : path.endsWith('/user-transfer-limit') ? 'limit refreshes'
+          : path.includes('/robux-transfer/transfer/') ? 'transfer status checks'
           : path.startsWith('/transaction-records/') ? 'transfer history'
-          : path.endsWith('/user/currency') ? 'balance refreshes' : 'recipient lookups';
+          : path.endsWith('/user/currency') ? 'balance refreshes'
+          : path.startsWith('/child-requests-api/') ? 'parent requests' : 'recipient lookups';
         if (!error.hasChallenge) error.message = 'Roblox rate limited ' + requestName + '. Wait for the cooldown before resuming.';
       }
-      error.definitelyRejected = [400, 401, 403, 404, 422, 429].includes(response.status);
+      error.definitelyRejected = error.parentConsentRequired || [400, 401, 403, 404, 422, 429].includes(response.status);
       throw error;
     }
+    if (!data && allowEmpty) return {};
     if (!data) throw new Error('Roblox returned an empty response.');
     return data;
   }
 
   function updateAccountDisplay() {
     const balanceValue = element('span', '', { class: 'money account-balance' });
-    showRobux(balanceValue, balance);
+    if (Number.isSafeInteger(balance) && balance >= 0) showRobux(balanceValue, balance);
+    else balanceValue.textContent = 'Unavailable';
     if (balanceEstimated) {
       balanceValue.append(element('small', 'est.'));
       balanceValue.setAttribute('aria-label', balance + ' Robux, estimated');
     }
     accountLabel.className = 'account-line';
     accountLabel.replaceChildren(element('span', 'From @' + account.name), balanceValue);
-    amount.max = String(limits.perTransferLimit);
-    limitsLabel.textContent = '10–' + new Intl.NumberFormat('en-US').format(limits.perTransferLimit) + ' Robux per transfer.';
+    if (Number.isSafeInteger(limits?.perTransferLimit)) {
+      amount.max = String(limits.perTransferLimit);
+      limitsLabel.textContent = '10–' + new Intl.NumberFormat('en-US').format(limits.perTransferLimit) + ' Robux per transfer.';
+    } else {
+      amount.removeAttribute('max');
+      limitsLabel.textContent = 'Per-transfer limit unavailable · try Refresh';
+    }
     if (balance < 10) limitsLabel.textContent = 'Your balance is below the 10 Robux minimum.';
   }
 
@@ -1886,6 +2377,31 @@
     }
   }
 
+  async function fetchHistoryPage(userId, cursor) {
+    const key = userId + ':' + cursor;
+    const cached = historyPages.get(key);
+    if (cached?.request) return cached.request;
+    if (cached?.page && cached.fetchedAt > Date.now() - historyReadMinimumMs) return cached.page;
+    const entry = {};
+    entry.request = (async () => {
+      const url = new URL('https://apis.roblox.com/transaction-records/v1/users/' + userId + '/transactions');
+      url.search = new URLSearchParams({ cursor, limit: '100', transactionType: 'CurrencyTransfer', itemPricingType: 'PaidAndLimited' });
+      const page = await api(url, undefined, {
+        signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(15000)]), preserveTransferId: true,
+      });
+      if (!Array.isArray(page.data)) throw new Error('Roblox did not return transfer history.');
+      entry.page = page;
+      entry.fetchedAt = Date.now();
+      return page;
+    })();
+    historyPages.set(key, entry);
+    try { return await entry.request; }
+    finally {
+      entry.request = null;
+      if (!entry.page) historyPages.delete(key);
+    }
+  }
+
   async function fetchTransferHistory(userId) {
     const grouped = new Map();
     const seenRows = new Set();
@@ -1896,12 +2412,8 @@
     do {
       if (seenCursors.has(cursor)) throw new Error('Roblox repeated a history page.');
       seenCursors.add(cursor);
-      const url = new URL('https://apis.roblox.com/transaction-records/v1/users/' + userId + '/transactions');
-      url.search = new URLSearchParams({ cursor, limit: '100', transactionType: 'CurrencyTransfer', itemPricingType: 'PaidAndLimited' });
-      const page = await api(url, undefined, {
-        signal: AbortSignal.any([profileLookups.signal, AbortSignal.timeout(15000)]),
-      });
-      if (!Array.isArray(page.data)) throw new Error('Roblox did not return transfer history.');
+      const page = await fetchHistoryPage(userId, cursor);
+      const pageObservedAt = Math.min(observedAt, historyPages.get(userId + ':' + cursor)?.fetchedAt ?? observedAt);
       for (const row of page.data) {
         const details = row.details || {};
         if (String(details.senderTargetId) !== String(userId)) continue;
@@ -1919,8 +2431,9 @@
         const id = reference || String(row.idHash || rowKey);
         const transfer = grouped.get(id) || {
           id, reference, amount: 0, grossAmount: 0,
-          recipientId: details.recipientTargetId, createdMs, observedAt,
+          recipientId: details.recipientTargetId, createdMs, observedAt: pageObservedAt,
         };
+        transfer.observedAt = Math.min(transfer.observedAt, pageObservedAt);
         transfer.amount -= value;
         if (isSent) {
           transfer.grossAmount += Math.abs(value);
@@ -1936,12 +2449,34 @@
     return Array.from(grouped.values()).map((transfer) => ({ ...transfer, amount: Math.max(0, transfer.amount) }));
   }
 
-  async function refreshUsage(force = false) {
-    if (!account) return;
+  function scheduleUsageRefresh() {
+    clearTimeout(usageRefreshTimer);
+    if (!account || profileLookups.signal.aborted || (parentApproval && parentStatusPaused)) return;
+    const ownerId = account.id;
+    const pageFetchedAt = historyPages.get(ownerId + ':')?.fetchedAt || -Infinity;
+    const delay = Math.max(50, usageLastAttemptAt + historyReadMinimumMs - Date.now() + 10,
+      pageFetchedAt + historyReadMinimumMs - Date.now() + 10,
+      apiCooldownUntil - Date.now() + 10);
+    usageRefreshTimer = setTimeout(() => {
+      usageRefreshTimer = null;
+      if (profileLookups.signal.aborted || account?.id !== ownerId || (parentApproval && parentStatusPaused)) return;
+      if (batchRunning) { batchStatsDirty = true; return; }
+      refreshUsage(true, { trailing: true });
+    }, delay);
+  }
+
+  async function refreshUsage(force = false, { trailing = false } = {}) {
+    if (!account || (parentApproval && parentStatusPaused)) return;
     if (usageRequest) {
-      await usageRequest;
-      if (!account || profileLookups.signal.aborted) return;
-      return refreshUsage(force);
+      if (force) usageRefreshAfterRequest = true;
+      return usageRequest;
+    }
+    if (Date.now() < apiCooldownUntil) { scheduleUsageRefresh(); return; }
+    if (usageLastOwnerId === account.id && Date.now() - usageLastAttemptAt < historyReadMinimumMs) {
+      displayAllowances();
+      allowanceNote.textContent = usageReady ? 'History estimate · recent results reused' : 'History check paused · try again in 30 seconds';
+      if (force) scheduleUsageRefresh();
+      return;
     }
     const owner = account;
     const revision = statsRevision;
@@ -1956,6 +2491,14 @@
       return;
     }
     allowanceNote.textContent = 'Updating transfer history…';
+    clearTimeout(usageRefreshTimer);
+    usageRefreshTimer = null;
+    const cachedFirstPage = historyPages.get(owner.id + ':');
+    if (force && !trailing && cachedFirstPage?.page && cachedFirstPage.fetchedAt > Date.now() - historyReadMinimumMs) {
+      usageRefreshAfterRequest = true;
+    }
+    usageLastAttemptAt = Date.now();
+    usageLastOwnerId = owner.id;
     usageRequest = (async () => {
       try {
         const transfers = await fetchTransferHistory(owner.id);
@@ -1977,6 +2520,10 @@
       } finally {
         usageRequest = null;
         setBusy(busy);
+        if (usageRefreshAfterRequest) {
+          usageRefreshAfterRequest = false;
+          scheduleUsageRefresh();
+        }
       }
     })();
     setBusy(busy);
@@ -2051,7 +2598,9 @@
     setBusy(busy);
     return statsRequest;
   }
-  refreshAllowanceButton.addEventListener('click', () => { if (!busy) refreshAccountStats(); });
+  refreshAllowanceButton.addEventListener('click', () => {
+    if (!busy) return parentApproval ? checkParentTransfer({ manual: true }) : refreshAccountStats();
+  });
 
   function triggerSuccessAnimation() {
     successCheck.replaceChildren(svgIcon([
@@ -2075,10 +2624,10 @@
     }
   }
 
-  function showSuccess(transfer) {
+  function showSuccess(transfer, { recordUsage = true, refresh = true, confirmed = false } = {}) {
     const submittedAt = new Date();
-    lastReceipt = { ...transfer, sender: account.name, submittedAt: submittedAt.toLocaleString() };
-    acceptedTransfers.push({ id: transfer.id, recipientId: transfer.recipientId, amount: transfer.amount, createdMs: submittedAt.getTime() });
+    lastReceipt = { ...transfer, sender: account.name, submittedAt: submittedAt.toLocaleString(), confirmed };
+    if (recordUsage) acceptedTransfers.push({ id: transfer.id, recipientId: transfer.recipientId, amount: transfer.amount, createdMs: submittedAt.getTime() });
     displayAllowances();
     transferTitle.textContent = 'Transfer submitted';
     recipientSection.hidden = true;
@@ -2093,23 +2642,28 @@
     }));
     loadAvatars([avatar], profileLookups.signal);
     receiptSender.textContent = '@' + account.name;
+    receiptTime.parentElement.querySelector('dt').textContent = confirmed ? 'Confirmed' : 'Time';
     receiptTime.textContent = lastReceipt.submittedAt;
     receiptReference.textContent = transfer.id;
+    receiptTransferId.textContent = normalizeTransferId(transfer.transferId);
+    receiptTransferId.parentElement.hidden = !receiptTransferId.textContent;
     receiptStatus.textContent = '';
     newTransferButton.hidden = false;
-    refreshAfterSend();
+    if (refresh) refreshAfterSend();
   }
 
   copyReceiptButton.addEventListener('click', async () => {
     if (!lastReceipt) return;
     try {
       await navigator.clipboard.writeText([
-        'Robux transfer submitted',
+        'Robux transfer ' + (lastReceipt.confirmed ? 'completed' : lastReceipt.verifiedSent ? 'sent' : 'submitted'),
         'From: @' + lastReceipt.sender,
         'To: @' + lastReceipt.username + ' (' + lastReceipt.recipientId + ')',
         'Amount: ' + lastReceipt.amount + ' Robux',
-        'Time: ' + lastReceipt.submittedAt,
+        (lastReceipt.confirmed ? 'Confirmed: ' : lastReceipt.verifiedSent ? 'Verified: ' : 'Time: ') + lastReceipt.submittedAt,
         'Reference: ' + lastReceipt.id,
+        ...(lastReceipt.transferId ? ['Transfer ID: ' + lastReceipt.transferId] : []),
+        ...(lastReceipt.verifiedSent ? ['Sent verified in My Transactions. Recipient acceptance has not been verified.'] : []),
       ].join('\n'));
       receiptStatus.textContent = 'Receipt copied.';
       copyReceiptButton.textContent = 'Copied ✓';
@@ -2531,18 +3085,21 @@
         sessionStorage.removeItem(pendingKey);
         showSuccess(transfer);
       } catch (error) {
-        if (error.definitelyRejected) {
+        if (error.parentConsentRequired) {
+          beginParentApproval(transfer);
+          status.textContent = 'Parent approval is required. Use Ask parent below.';
+        } else if (error.definitelyRejected) {
           sessionStorage.removeItem(pendingKey);
           locked = false;
         } else {
           acknowledgedButton.hidden = false;
         }
-        status.textContent = error.definitelyRejected ? error.message
+        if (!error.parentConsentRequired) status.textContent = error.definitelyRejected ? error.message
           : error.message + ' The outcome is unconfirmed. Check My Transactions before sending again.';
       }
       prepared = null;
       sendButton.hidden = true;
-      transactionsLink.hidden = false;
+      transactionsLink.hidden = Boolean(parentApproval);
     } catch (error) {
       status.textContent = error.message;
     } finally {
@@ -2583,7 +3140,8 @@
   });
 
   function restoreBatch(saved) {
-    const statuses = new Set(['waiting', 'preparing', 'sending', 'submitted', 'failed', 'unconfirmed', 'skipped']);
+    const statuses = new Set(['waiting', 'preparing', 'sending', 'submitted', 'failed', 'unconfirmed', 'skipped',
+      'parent_required', 'parent_requesting', 'parent_pending', 'parent_unknown', 'parent_checked', 'parent_cancelled', 'parent_failed', 'parent_refunded']);
     if (saved?.version !== 1 || !Number.isSafeInteger(saved.senderId) || saved.senderId <= 0 ||
         !Array.isArray(saved.rows) || !saved.rows.length || saved.rows.length > 50) return false;
     const ids = new Set();
@@ -2598,13 +3156,15 @@
     batchNextRecipientAt = Number.isFinite(saved.nextRecipientAt) ? saved.nextRecipientAt : 0;
     batchRows = saved.rows.map((row) => ({
       ...row,
-      status: row.status === 'sending' ? 'unconfirmed' : row.status === 'preparing' ? 'waiting' : row.status,
+      transferId: normalizeTransferId(row.transferId) || undefined,
+      status: row.status === 'sending' ? 'unconfirmed' : row.status === 'preparing' ? 'waiting'
+        : row.status === 'parent_requesting' ? 'parent_unknown' : row.status,
     }));
     batchPhase = saved.phase === 'draft' && batchRows.every((row) => row.status === 'waiting') ? 'draft'
-      : remainingBatchRows().length || hasUnknownBatchRow() ? 'paused' : 'complete';
+      : remainingBatchRows().length || hasUnknownBatchRow() || hasParentApprovalRow() ? 'paused' : 'complete';
     batchMode = true;
     batchSnapshot = null;
-    locked = hasUnknownBatchRow();
+    locked = hasUnknownBatchRow() || hasParentApprovalRow();
     resetRecipientEditor();
     renderBatch(true);
     return true;
@@ -2617,19 +3177,69 @@
   try { pending = JSON.parse(sessionStorage.getItem(pendingKey)); } catch { /* No saved attempt. */ }
   let savedBatch;
   try { savedBatch = JSON.parse(sessionStorage.getItem(batchKey)); } catch { /* No saved batch. */ }
+  parentApproval = readParentApproval(pending);
   const restoredBatch = (!pending?.id || pending.batch === true) && restoreBatch(savedBatch);
   if (restoredBatch && pending?.id) {
     const row = batchRows.find((entry) => entry.reference === pending.id);
-    if (row?.status === 'submitted') {
-      try { sessionStorage.removeItem(pendingKey); pending = null; } catch { /* Preserve the submitted row; never repeat it. */ }
-    } else if (row) {
+    if ((row?.status === 'submitted' || row?.status === 'parent_checked' || row?.status === 'parent_cancelled' || row?.status === 'parent_failed' || row?.status === 'parent_refunded')
+        && !terminalParentStatus(parentApproval?.transferStatus)) {
+      parentApproval = null;
+      try { sessionStorage.removeItem(pendingKey); pending = null; } catch { /* Preserve the submitted or checked row; never repeat it. */ }
+    } else if (row && !parentApproval && !row.status.startsWith('parent_')) {
       row.status = 'unconfirmed';
       row.error = 'Previous request is unconfirmed. Check My Transactions; this row will not be retried.';
       locked = true;
     }
     renderBatch(true);
   }
-  if (restoredBatch && (!pending?.id || batchRows.some((row) => row.reference === pending.id))) {
+  if (restoredBatch && !parentApproval) {
+    const row = batchRows.find((entry) => ['parent_required', 'parent_requesting', 'parent_pending', 'parent_unknown'].includes(entry.status));
+    if (row && (!pending?.id || pending.id === row.reference)) {
+      const states = { parent_required: 'required', parent_requesting: 'unknown', parent_pending: 'requested', parent_unknown: 'unknown' };
+      parentApproval = readParentApproval({ id: row.reference, senderId: batchSenderId,
+        recipientId: row.recipientId, username: row.username, amount: row.amount, batch: true,
+        parentApproval: states[row.status], transferStatus: row.parentTransferStatus, confirmationSource: row.parentConfirmationSource, transferId: row.transferId });
+    }
+  }
+  if (parentApproval) {
+    if (!restoredBatch || !parentApproval.batch || !batchRows.some((row) => row.reference === parentApproval.id)) {
+      if (parentApproval.batch) parentApproval.parentApproval = 'unknown';
+      parentApproval.batch = false;
+      batchMode = false;
+      setBatchDrawerOpen(false, true);
+      modeSwitch.dataset.mode = 'single';
+      singleModeButton.setAttribute('aria-pressed', 'true');
+      batchModeButton.setAttribute('aria-pressed', 'false');
+      recipientSection.hidden = true;
+      form.hidden = false;
+      editFields.hidden = true;
+      review.hidden = false;
+      sendButton.hidden = true;
+      acknowledgedButton.hidden = true;
+      transactionsLink.hidden = true;
+      reviewedRecipient.textContent = 'To @' + parentApproval.username + ' · User ID ' + parentApproval.recipientId;
+      showRobux(total, parentApproval.amount);
+      status.textContent = 'This transfer requires parent approval. It will not be processed again by this script.';
+    } else {
+      const row = batchRows.find((entry) => entry.reference === parentApproval.id);
+      const states = { required: 'parent_required', requesting: 'parent_requesting', requested: 'parent_pending', unknown: 'parent_unknown' };
+      const outcomes = { Completed: 'submitted', Submitted: 'submitted', Cancelled: 'parent_cancelled', Failed: 'parent_failed', Refunded: 'parent_refunded' };
+      row.status = outcomes[parentApproval.transferStatus] || states[parentApproval.parentApproval];
+      batchPhase = 'paused';
+      renderBatch(true);
+    }
+    try { sessionStorage.setItem(pendingKey, JSON.stringify(parentApproval)); } catch { /* Keep the pending request locked in memory. */ }
+    locked = true;
+    accountLabel.textContent = 'Parent approval pending';
+    dailyAllowance.value.classList.remove('is-loading');
+    monthlyAllowance.value.classList.remove('is-loading');
+    dailyAllowance.value.textContent = 'Unavailable';
+    monthlyAllowance.value.textContent = 'Unavailable';
+    allowanceNote.textContent = 'Check this transfer in Roblox before continuing';
+    renderParentApproval();
+    setBusy(false);
+    if (['requested', 'unknown'].includes(parentApproval.parentApproval) || parentApproval.transferStatus) startParentStatusWatch();
+  } else if (restoredBatch && (!pending?.id || batchRows.some((row) => row.reference === pending.id))) {
     if (hasUnknownBatchRow()) {
       accountLabel.textContent = 'Check the previous batch request first';
       dailyAllowance.value.classList.remove('is-loading');
@@ -2675,3 +3285,4 @@
     loadAccount();
   }
 })();
+
